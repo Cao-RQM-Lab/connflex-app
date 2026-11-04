@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "connflex-app"
+version = "0.1.0"
+description = "Desktop GUI for connflex-core: GDS layouts to rigid-body/beam models, modes, and stiffness"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "connflex-core[gds]>=0.1.0",
+    "PySide6>=6.6",
+    "PyOpenGL>=3.1.6",
+    "numpy>=1.26",
+    "shapely>=2.1",
+]
+
+[project.scripts]
+connflex-app = "connflex_app.app:main"
+
+[tool.setuptools.packages.find]
+include = ["connflex_app*"]
