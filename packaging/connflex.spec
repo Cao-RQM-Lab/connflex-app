@@ -14,6 +14,13 @@ sys.path.insert(0, ROOT)
 
 from connflex_app import __version__  # noqa: E402
 
+try:
+    from packaging.version import Version
+
+    BUNDLE_VERSION = Version(__version__).base_version  # e.g. 0.1.2 for 0.1.2.dev3+g1234567
+except Exception:  # noqa: BLE001
+    BUNDLE_VERSION = "0.0.0"
+
 NAME = "ConnFlex"
 IS_MAC = sys.platform == "darwin"
 IS_WIN = sys.platform.startswith("win")
@@ -129,12 +136,13 @@ if IS_MAC:
         name=f"{NAME}.app",
         icon=icon if os.path.exists(icon) else None,
         bundle_identifier="org.connflex.app",
-        version=__version__,
+        version=BUNDLE_VERSION,
         info_plist={
             "CFBundleName": NAME,
             "CFBundleDisplayName": NAME,
-            "CFBundleShortVersionString": __version__,
-            "CFBundleVersion": __version__,
+            "CFBundleShortVersionString": BUNDLE_VERSION,
+            "CFBundleVersion": BUNDLE_VERSION,
+            "ConnFlexVersion": __version__,
             "NSHighResolutionCapable": True,
             "NSPrincipalClass": "NSApplication",
             "LSMinimumSystemVersion": "12.0",

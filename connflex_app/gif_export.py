@@ -5,14 +5,14 @@ from __future__ import annotations
 import os
 from collections.abc import Callable
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QImage
-
 Frame = tuple[bytes, int, int]
 
 
-def frame_from_qimage(image: QImage, scale: float = 1.0) -> Frame:
-    """Tightly packed RGB bytes of ``image`` scaled by ``scale``, with its width and height."""
+def frame_from_qimage(image, scale: float = 1.0) -> Frame:
+    """Tightly packed RGB bytes of a ``QImage`` scaled by ``scale``, with its width and height."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QImage
+
     if scale != 1.0:
         image = image.scaled(
             max(int(image.width() * scale), 1),

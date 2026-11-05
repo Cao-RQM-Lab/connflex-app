@@ -24,11 +24,14 @@ jobs:
             label: macos-arm64
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # setuptools-scm derives the version from git tags
+          fetch-tags: true
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: pip
+          cache: ${{ !env.ACT && 'pip' || '' }}  # pip cache on GitHub; off under act, whose containers cannot run the post step
 
       - name: Install
         run: |
@@ -41,8 +44,9 @@ jobs:
         run: |
           VERSION=$(python -c "import connflex_app; print(connflex_app.__version__)")
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "version from git: $VERSION"
           if [[ "${GITHUB_REF}" == refs/tags/v* && "${GITHUB_REF#refs/tags/v}" != "$VERSION" ]]; then
-            echo "Tag ${GITHUB_REF#refs/tags/} does not match connflex_app.__version__ = $VERSION" >&2
+            echo "setuptools-scm computed $VERSION for tag ${GITHUB_REF#refs/tags/}; is the tag on this commit and the checkout complete?" >&2
             exit 1
           fi
 
@@ -116,6 +120,7 @@ jobs:
             "ConnFlex-${{ steps.version.outputs.version }}-macos-arm64.dmg"
 
       - uses: actions/upload-artifact@v4
+        if: ${{ !env.ACT }}  # act has no GitHub artifact service; the archive is already in the job's workspace
         with:
           name: ConnFlex-${{ matrix.label }}
           path: |

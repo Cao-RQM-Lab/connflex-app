@@ -107,14 +107,17 @@ workflow does, `make dist` chains those three, and `make clean` removes every bu
 ## Releases
 
 Builds are produced by `.github/workflows/release.yml` with PyInstaller (see
-`packaging/README.md`). To publish a release, bump `__version__` in
-`connflex_app/__init__.py`, then push a matching tag:
+`packaging/README.md`). The version is never written in the source: setuptools-scm derives
+it from the git tag (`vX.Y.Z` gives `X.Y.Z`; later commits give `X.Y.Z+1.devN+g<sha>`), and
+`connflex_app.__version__` reports it at runtime. To publish a release, tag and push:
 
 ```sh
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.1.2
+git push origin v0.1.2
 ```
 
-The workflow builds and self-tests the bundle on all three platforms, then attaches
+With Docker and [act](https://github.com/nektos/act) installed, `make act-ci` runs the CI
+workflow locally and `make act-release` runs the Linux build job of the release workflow,
+both emulating the x64 GitHub runner. The workflow builds and self-tests the bundle on all three platforms, then attaches
 `ConnFlex-<version>-linux-x64.tar.gz`, `-windows-x64.zip`, `-macos-arm64.dmg`, and a
 `SHA256SUMS.txt` to the release. `workflow_dispatch` builds the artifacts without publishing.

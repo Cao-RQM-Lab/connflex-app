@@ -12,3 +12,5 @@ ConnFlex-*.dmg
 ConnFlex-*.zip
 ConnFlex-*.tar.gz
 .pytest_cache/
+.act-artifacts/
+connflex_app/_version.py

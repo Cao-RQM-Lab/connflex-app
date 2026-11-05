@@ -18,6 +18,10 @@ dist/ConnFlex.app/Contents/MacOS/ConnFlex --smoke-test    # real GUI, saves smok
 
 `make_icons.py` regenerates `icon.png`, `icon.ico`, and `icon.icns`.
 
+The bundle's version comes from the git tag through setuptools-scm (run the build from a
+checkout with tags fetched). Apple's `CFBundleShortVersionString` gets the plain `X.Y.Z`
+part; the full version string is stored under the `ConnFlexVersion` key of `Info.plist`.
+
 The GitHub release workflow (`.github/workflows/release.yml`) runs these steps on Linux,
 Windows, and Apple-silicon macOS runners whenever a `v*` tag is pushed, and attaches the
 archives to a GitHub release. The macOS app is ad-hoc signed, not notarized: on first launch,

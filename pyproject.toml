@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=68", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "connflex-app"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Desktop GUI for connflex-core: GDS layouts to rigid-body/beam models, modes, and stiffness"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -19,14 +19,18 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-build = ["pyinstaller>=6.11"]
-dev = ["pytest>=8", "ruff>=0.5"]
+build = ["pyinstaller>=6.11", "setuptools-scm>=8", "packaging>=23"]
+dev = ["pytest>=8", "ruff>=0.5", "setuptools-scm>=8", "packaging>=23"]
 
 [project.scripts]
 connflex-app = "connflex_app.app:main"
 
 [tool.setuptools.packages.find]
 include = ["connflex_app*"]
+
+[tool.setuptools_scm]
+# The version is the latest git tag (vX.Y.Z); commits after a tag give X.Y.(Z+1).devN+g<sha>.
+version_file = "connflex_app/_version.py"
 
 [tool.setuptools.package-data]
 connflex_app = ["data/*.gds", "data/*.toml", "data/*.png"]

@@ -29,8 +29,11 @@ STAMP   := $(VENV)/.installed
 VERSION  = $(shell $(PY) -c "import connflex_app; print(connflex_app.__version__)")
 ARCHIVE  = $(NAME)-$(VERSION)-$(PLATFORM)
 
+ACT_IMAGE ?= catthehacker/ubuntu:act-22.04
+ACT_FLAGS ?= -P ubuntu-22.04=$(ACT_IMAGE) --container-architecture linux/amd64 --rm
+
 .DEFAULT_GOAL := help
-.PHONY: help venv install lint test check run demo icons build verify package dist clean distclean
+.PHONY: help venv install lint test check run demo icons build verify package dist clean distclean act-ci act-release
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}'
@@ -84,8 +87,14 @@ endif
 
 dist: build verify package ## Build, verify, and package in one go
 
+act-ci: ## Run the CI workflow locally with act (needs Docker; emulates the x64 GitHub runner)
+	act push -W .github/workflows/ci.yml $(ACT_FLAGS)
+
+act-release: ## Run the Linux job of the release workflow locally with act (slow: PyInstaller under emulation)
+	act workflow_dispatch -W .github/workflows/release.yml --matrix os:ubuntu-22.04 --artifact-server-path $(CURDIR)/.act-artifacts $(ACT_FLAGS)
+
 clean: ## Remove build outputs, caches, and test artifacts (keeps the virtual environment)
-	rm -rf build dist *.egg-info .pytest_cache .ruff_cache smoke-*.png smoke_test.png $(NAME)-*.dmg $(NAME)-*.zip $(NAME)-*.tar.gz
+	rm -rf build dist *.egg-info .pytest_cache .ruff_cache .act-artifacts smoke-*.png smoke_test.png $(NAME)-*.dmg $(NAME)-*.zip $(NAME)-*.tar.gz
 	find . -path ./$(VENV) -prune -o -name __pycache__ -type d -print0 | xargs -0 rm -rf
 
 distclean: clean ## Also remove the virtual environment
