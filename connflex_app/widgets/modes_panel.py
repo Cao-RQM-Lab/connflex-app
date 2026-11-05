@@ -40,6 +40,7 @@ class ModesPanel(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self._hidden = 0
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(8)
@@ -126,13 +127,17 @@ class ModesPanel(QWidget):
         )
         self.solve_button.setEnabled(True)
 
-    def set_modal(self, modal, labels: list[str], elapsed: float | None = None) -> None:
+    def set_modal(self, modal, labels: list[str], elapsed: float | None = None, hidden: int = 0, free=()) -> None:
+        """List the modes of ``modal`` after the first ``hidden`` ones (rigid-body modes of ``free`` bodies)."""
         self.table.blockSignals(True)
+        self.table.setUpdatesEnabled(False)
         self.table.setRowCount(0)
+        self._hidden = hidden
         if modal is None:
+            self.table.setUpdatesEnabled(True)
             self.table.blockSignals(False)
             return
-        frequencies = modal.frequencies_hz
+        frequencies = modal.frequencies_hz[hidden:]
         self.table.setRowCount(len(frequencies))
         for row, frequency in enumerate(frequencies):
             number = QTableWidgetItem(str(row + 1))
@@ -142,24 +147,38 @@ class ModesPanel(QWidget):
             self.table.setItem(row, 0, number)
             self.table.setItem(row, 1, freq_item)
             self.table.setItem(row, 2, QTableWidgetItem(labels[row] if row < len(labels) else ""))
+        self.table.setUpdatesEnabled(True)
         self.table.blockSignals(False)
         count = len(frequencies)
-        text = f"{count} mode{'s' if count != 1 else ''} from {fmt_freq(float(frequencies[0]))} to {fmt_freq(float(frequencies[-1]))}."
+        if count:
+            text = f"{count} mode{'s' if count != 1 else ''} from {fmt_freq(float(frequencies[0]))} to {fmt_freq(float(frequencies[-1]))}."
+        else:
+            text = "Every solved mode is a rigid-body mode of a free body; ask for more modes or fix the suspension."
         if elapsed is not None:
             text += f" Solved in {elapsed * 1000:.0f} ms." if elapsed < 1.0 else f" Solved in {elapsed:.2f} s."
+        free = list(free)
+        if free:
+            names = ", ".join(f"body {b}" for b in free[:8]) + (" …" if len(free) > 8 else "")
+            text += (
+                f" {len(free)} free bod{'y' if len(free) == 1 else 'ies'} ({names}) ha{'s' if len(free) == 1 else 've'} no beam path "
+                f"to the anchor; {hidden} rigid-body mode{'s' if hidden != 1 else ''} at 0 Hz hidden."
+            )
         self.summary.setText(text)
 
     def select_mode(self, index: int) -> None:
+        """Select the row of mode ``index`` (an index into the full modal result)."""
         self.table.blockSignals(True)
-        if index < 0:
+        row = index - self._hidden
+        if row < 0:
             self.table.clearSelection()
         else:
-            self.table.selectRow(index)
+            self.table.selectRow(row)
         self.table.blockSignals(False)
 
     def current_mode(self) -> int:
+        """Index into the full modal result of the selected row, or -1."""
         rows = self.table.selectionModel().selectedRows()
-        return rows[0].row() if rows else -1
+        return rows[0].row() + self._hidden if rows else -1
 
     def _selection_changed(self) -> None:
         self.modeSelected.emit(self.current_mode())

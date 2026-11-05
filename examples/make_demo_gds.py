@@ -64,9 +64,21 @@ def build() -> gdstk.Library:
     return lib
 
 
+def build_array(n: int) -> gdstk.Library:
+    """An n by n array of the resonator, handles touching, for performance testing."""
+    lib = build()
+    unit = lib.cells[0]
+    top = lib.new_cell(f"ARRAY_{n}x{n}")
+    top.add(gdstk.Reference(unit, (0, 0), columns=n, rows=n, spacing=(1200, 1200)))
+    return lib
+
+
 def main(argv: list[str]) -> int:
-    out = pathlib.Path(argv[1] if len(argv) > 1 else pathlib.Path(__file__).with_name("demo_resonator.gds"))
-    build().write_gds(str(out))
+    args = [a for a in argv[1:] if not a.startswith("--")]
+    array = next((int(a.split("=", 1)[1]) for a in argv[1:] if a.startswith("--array=")), 0)
+    default = f"demo_array_{array}x{array}.gds" if array else "demo_resonator.gds"
+    out = pathlib.Path(args[0] if args else pathlib.Path(__file__).with_name(default))
+    (build_array(array) if array else build()).write_gds(str(out))
     print(f"wrote {out}")
     return 0
 

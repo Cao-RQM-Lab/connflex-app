@@ -5,12 +5,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from PySide6.QtCore import QObject, Signal
-from shapely import MultiPolygon, Polygon
+from shapely import Polygon
+from shapely.geometry.base import BaseGeometry
 
 from connflex_core import ExtractionParams, Layout, ModalResult, Stack, Structure
 from connflex_core.mechanics.assembly import SystemMatrices
 
 from connflex_app.geometry import Mesh
+from connflex_app.render2d import RenderData
 from connflex_app.settings import Settings
 
 
@@ -25,9 +27,10 @@ class Project:
     params: ExtractionParams
     structure: Structure
     holes: list[Polygon]
-    plates: dict[int, MultiPolygon]
+    plates: dict[int, BaseGeometry]
     mesh: Mesh
     system: SystemMatrices
+    render: RenderData
     modal: ModalResult | None = None
     timings: dict[str, float] = field(default_factory=dict)
 

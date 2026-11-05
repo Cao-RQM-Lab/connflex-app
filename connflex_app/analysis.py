@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import networkx as nx
 import numpy as np
 from numpy.typing import NDArray
 
@@ -16,6 +17,18 @@ CONDITIONS: tuple[tuple[str, str], ...] = (
     ("custom", "Custom: choose which bodies are fixed"),
 )
 ROTATIONAL = ("tx", "ty", "tz")
+
+
+def free_bodies(structure: Structure) -> list[int]:
+    """Movable bodies with no beam path to the anchor. Each adds six rigid-body modes at 0 Hz."""
+    graph = structure.graph
+    reachable = nx.node_connected_component(graph, 0) if 0 in graph else set()
+    return sorted(body.index for body in structure.bodies if not body.anchor and body.index not in reachable)
+
+
+def rigid_mode_count(structure: Structure) -> int:
+    """Number of zero-frequency modes: six per connected group of bodies that misses the anchor."""
+    return 6 * sum(1 for component in nx.connected_components(structure.graph) if 0 not in component)
 
 
 def dof_offsets(system: SystemMatrices) -> dict[int, int]:

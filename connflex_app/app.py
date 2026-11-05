@@ -20,21 +20,68 @@ def _configure_surface_format() -> None:
     QSurfaceFormat.setDefaultFormat(fmt)
 
 
+USAGE = """usage: connflex-app [LAYOUT.gds] [--version] [--self-test] [--smoke-test [SCREENSHOT.png]]
+
+  --version     print the version and exit
+  --self-test   run the analysis pipeline on the bundled demo without a GUI and exit
+  --smoke-test  start the GUI, run the demo through extraction and the modal solve,
+                save a screenshot (default smoke_test.png), and exit
+"""
+
+
 def main(argv: list[str] | None = None) -> int:
+    args = list(argv if argv is not None else sys.argv)
+    options = args[1:]
+    if "--help" in options or "-h" in options:
+        print(USAGE)
+        return 0
+    if "--version" in options:
+        from connflex_app import __version__
+
+        print(f"ConnFlex {__version__}")
+        return 0
+    if "--self-test" in options:
+        from connflex_app.selftest import run
+
+        return run()
+
     _configure_surface_format()
     QCoreApplication.setOrganizationName("connflex")
     QCoreApplication.setApplicationName("ConnFlex")
-    app = QApplication(argv if argv is not None else sys.argv)
+    if "--smoke-test" in options:
+        # Keep the smoke test deterministic and leave the user's preferences untouched.
+        import tempfile
 
+        from PySide6.QtCore import QSettings
+
+        scratch = tempfile.mkdtemp(prefix="connflex-smoke-")
+        QSettings.setDefaultFormat(QSettings.Format.IniFormat)
+        QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, scratch)
+    app = QApplication([args[0]])
+
+    from PySide6.QtGui import QIcon
+
+    from connflex_app.data import icon_png
     from connflex_app.theme import apply_theme
 
     apply_theme(app)
+    if icon_png().is_file():
+        app.setWindowIcon(QIcon(str(icon_png())))
 
     from connflex_app.main_window import MainWindow
 
     window = MainWindow()
     window.show()
-    extra = app.arguments()[1:]
-    if extra:
-        window.open_path(extra[0])
+    if "--smoke-test" in options:
+        from connflex_app.smoke import SmokeTest
+
+        index = options.index("--smoke-test")
+        target = options[index + 1] if index + 1 < len(options) and not options[index + 1].startswith("-") else "smoke_test.png"
+        smoke = SmokeTest(window, target)
+        smoke.start()
+        app.exec()
+        return smoke.exit_code
+    paths = [option for option in options if not option.startswith("-")]
+    if paths:
+        window.open_path(paths[0])
     return app.exec()

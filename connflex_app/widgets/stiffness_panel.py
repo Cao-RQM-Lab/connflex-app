@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from connflex_app.analysis import CONDITIONS, StiffnessReport, condensed_stiffness
+from connflex_app.analysis import CONDITIONS, StiffnessReport, condensed_stiffness, free_bodies
 from connflex_app.geometry import DOF_LONG, DOF_ORDER, DOF_SHORT
 from connflex_app.session import Project
 from connflex_app.units import fmt_freq, fmt_mass, fmt_point, fmt_stiffness
@@ -156,11 +156,13 @@ class StiffnessPanel(QWidget):
         self.fixed_list.clear()
         if project is not None:
             structure = project.structure
+            free = set(free_bodies(structure))
             for body in structure.bodies:
                 if body.anchor:
                     continue
-                beams = sum(1 for beam in structure.beams if body.index in beam.bodies)
-                self.body_combo.addItem(f"Body {body.index}  ·  {fmt_mass(body.inertial.mass)}  ·  {beams} beam{'s' if beams != 1 else ''}", body.index)
+                beams = project.render.beam_counts.get(body.index, 0)
+                tag = "  ·  free" if body.index in free else ""
+                self.body_combo.addItem(f"Body {body.index}  ·  {fmt_mass(body.inertial.mass)}  ·  {beams} beam{'s' if beams != 1 else ''}{tag}", body.index)
             self.body_combo.setCurrentIndex(-1)
         self.body_combo.blockSignals(False)
         self.fixed_list.blockSignals(False)
@@ -257,7 +259,9 @@ class StiffnessPanel(QWidget):
         self.info.setText(
             f"Body {body}: mass {fmt_mass(rigid.inertial.mass)}, centre {fmt_point(rigid.inertial.center)}, "
             f"{len(beams)} beam{'s' if len(beams) != 1 else ''} to {', '.join('anchor' if n == 0 else f'body {n}' for n in neighbours) or 'nothing'}. "
-            f"Fixed: anchor" + (", " + ", ".join(f"body {b}" for b in report.fixed) if report.fixed else "") + "."
+            + ("Fixed: anchor." if not report.fixed else
+               "Fixed: anchor, " + ", ".join(f"body {b}" for b in report.fixed) + "." if len(report.fixed) <= 6 else
+               f"Fixed: anchor and {len(report.fixed)} other bodies.")
         )
         for row, name in enumerate(DOF_ORDER):
             rotational = name.startswith("t")

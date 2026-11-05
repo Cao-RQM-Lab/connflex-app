@@ -50,13 +50,28 @@ def pump(ms: int) -> None:
         time.sleep(0.01)
 
 
-def wait_until(predicate, timeout: float = 120.0, what: str = "") -> None:
+STALLS: dict[str, float] = {}
+
+
+def wait_until(predicate, timeout: float = 300.0, what: str = "", snapshots=()) -> None:
+    """Pump events until ``predicate`` holds, recording the longest single event-loop stall.
+
+    ``snapshots`` are (delay in seconds, callable) pairs run once the delay has passed.
+    """
     end = time.time() + timeout
+    started = time.time()
+    worst = 0.0
+    pending = list(snapshots)
     while time.time() < end:
+        t0 = time.perf_counter()
         app.processEvents()
+        worst = max(worst, time.perf_counter() - t0)
+        while pending and time.time() - started > pending[0][0]:
+            pending.pop(0)[1]()
         if predicate():
+            STALLS[what] = worst
             return
-        time.sleep(0.02)
+        time.sleep(0.005)
     raise TimeoutError(f"timed out waiting for {what}")
 
 
@@ -80,9 +95,29 @@ pump(400)
 shot("01_loaded.png")
 
 window.extract()
-wait_until(lambda: window.session.project is not None and window.session.project.modal is not None and not window._busy, what="extract+solve")
+wait_until(
+    lambda: window.session.project is not None and window.session.project.modal is not None and not window._busy,
+    what="extract+solve",
+    snapshots=(
+        (0.4, lambda: shot("01b_progress_during_extraction.png", window.statusBar())),
+        (1.7, lambda: shot("01c_progress_later.png", window.statusBar())),
+    ),
+)
 pump(900)
 shot("02_extracted_mode1_playing.png")
+print("structure:", len(window.session.project.structure.bodies), "bodies,", len(window.session.project.structure.beams), "beams, mesh", f"{window.session.project.mesh.count:,}", "verts; timings", {k: round(v, 2) for k, v in window.session.project.timings.items()})
+
+# GPU zoom: every step is a matrix change, so each paint must be quick even on large layouts.
+worst = 0.0
+for step in range(24):
+    t0 = time.perf_counter()
+    window.layout_view.zoom(1.25 if step < 16 else 0.8, QPointF(window.layout_view.width() * 0.55, window.layout_view.height() * 0.5))
+    window.layout_view.repaint()
+    app.processEvents()
+    worst = max(worst, time.perf_counter() - t0)
+STALLS["2d zoom step"] = worst
+window.layout_view.fit()
+pump(100)
 print("modes:", [row for row in window.modes.table.item(0, 2).text()], window.modes.summary.text())
 print("hover beam:", window.layout_view.describe("beam", 0)["text"])
 print("settings used:", window.session.project.settings.device, window.session.project.settings.handle, window.session.project.settings.release, window.session.project.settings.vias)
@@ -115,6 +150,14 @@ window.scene._phase = math.pi / 2
 pump(250)
 shot("06_3d_mode2_peak.png", window.scene)
 
+gif_path = os.path.join(out, "mode2.gif")
+window.export_gif(gif_path, frames=12, fps=20, scale=0.5)
+wait_until(lambda: not window._busy, what="gif export")
+from PIL import Image  # noqa: E402
+
+with Image.open(gif_path) as gif:
+    print("gif:", gif.n_frames, "frames", gif.size, f"{os.path.getsize(gif_path) / 1e3:.0f} kB", "loop", gif.info.get("loop"))
+
 window.scene_options_bar.button("color_body").setChecked(True)
 window.scene_bar.button("handle").setChecked(False)
 pump(250)
@@ -146,8 +189,9 @@ QTest.mouseClick(window.scene, Qt.MouseButton.LeftButton, pos=QPoint(int(window.
 pump(300)
 print("3d click selected body:", window.session.selected, "| stiffness body combo:", window.stiffness.body_combo.currentText() or "(anchor: none)")
 
-window.layout_view._scale *= 40
-window.layout_view._center[:] = [300e-6, 600e-6]
+bounds = window.layout_view._bounds
+window.layout_view._center[:] = [bounds[0] + 0.25 * (bounds[2] - bounds[0]), bounds[1] + 0.5 * (bounds[3] - bounds[1])]
+window.layout_view.zoom(40.0)
 pump(400)
 shot("09_2d_deep_zoom.png", window.layout_view)
 
@@ -157,6 +201,7 @@ shot("10_3d_only.png")
 window.view_actions["split"].trigger()
 pump(200)
 
+print("worst event-loop stalls:", {k: f"{v * 1000:.0f} ms" for k, v in STALLS.items()})
 print("TOUR OK")
 window.close()
 app.processEvents()

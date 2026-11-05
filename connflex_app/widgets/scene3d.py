@@ -1,4 +1,9 @@
-"""3D view of the extruded structure with live mode animation, orbit camera, and picking."""
+"""3D view of the extruded structure with live mode animation, orbit camera, and picking.
+
+The mesh is uploaded once as indexed geometry. Rigid-body motion of every mode is applied in
+the vertex shader from a small per-body transform texture, so selecting a mode or a
+deflection shape never touches the vertex buffers. Colours are also resolved in the shader.
+"""
 
 from __future__ import annotations
 
@@ -13,29 +18,51 @@ from PySide6.QtOpenGL import QOpenGLFramebufferObject
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 
 from connflex_app import theme
-from connflex_app.geometry import KIND_BEAM, KIND_BOX, KIND_DEVICE, KIND_HANDLE, KIND_REJECTED, Mesh
+from connflex_app.geometry import KIND_BEAM, KIND_BOX, KIND_DEVICE, KIND_HANDLE, KIND_REJECTED, SCENE_UNIT, Mesh, motion_peak
 
 VERTEX_SHADER = """
 #version 330 core
 layout(location = 0) in vec3 a_position;
 layout(location = 1) in vec3 a_normal;
-layout(location = 2) in vec3 a_disp;
-layout(location = 3) in vec3 a_color;
-layout(location = 4) in float a_body;
+layout(location = 2) in vec2 a_bodies;
+layout(location = 3) in float a_blend;
+layout(location = 4) in float a_kind;
 uniform mat4 u_proj;
 uniform mat4 u_view;
 uniform float u_scale;
+uniform sampler2D u_motion;
+uniform sampler2D u_body_colors;
+uniform vec3 u_kind_colors[5];
+uniform float u_color_mode;
 out vec3 v_normal;
 out vec3 v_position;
 out vec3 v_color;
 flat out float v_body;
+
+vec3 rigid(int body, vec3 p) {
+    if (body < 0) return vec3(0.0);
+    vec3 u = texelFetch(u_motion, ivec2(0, body), 0).xyz;
+    vec3 w = texelFetch(u_motion, ivec2(1, body), 0).xyz;
+    vec3 c = texelFetch(u_motion, ivec2(2, body), 0).xyz;
+    return u + cross(w, p - c);
+}
+
 void main() {
-    vec3 p = a_position + u_scale * a_disp;
+    int a = int(floor(a_bodies.x + 0.5));
+    int b = int(floor(a_bodies.y + 0.5));
+    int kind = int(floor(a_kind + 0.5));
+    vec3 d = mix(rigid(a, a_position), rigid(b, a_position), a_blend);
+    vec3 p = a_position + u_scale * d;
     vec4 pv = u_view * vec4(p, 1.0);
     v_position = pv.xyz;
     v_normal = mat3(u_view) * a_normal;
-    v_color = a_color;
-    v_body = a_body;
+    vec3 color = u_kind_colors[kind];
+    if (u_color_mode > 0.5 && kind <= 2 && a >= 0) {
+        float shade = (kind == 2) ? 0.55 : ((kind == 1) ? 0.8 : 1.0);
+        color = texelFetch(u_body_colors, ivec2(0, a), 0).rgb * shade;
+    }
+    v_color = color;
+    v_body = (kind == 3) ? -1.0 : float(a);
     gl_Position = u_proj * pv;
 }
 """
@@ -59,7 +86,9 @@ void main() {
     }
     vec3 n = normalize(v_normal);
     vec3 v = normalize(-v_position);
-    if (dot(n, v) < 0.0) n = -n;
+    float facing = dot(n, v);
+    float back = facing < 0.0 ? 0.55 : 1.0;   // faces seen from behind (e.g. through a hole) are darker
+    if (facing < 0.0) n = -n;
     vec3 l = normalize(vec3(0.35, 0.45, 1.0));
     float diffuse = max(dot(n, l), 0.0);
     vec3 h = normalize(l + v);
@@ -68,12 +97,13 @@ void main() {
     vec3 color = v_color;
     if (v_body >= 0.0 && abs(v_body - u_selected) < 0.5) color = mix(color, u_select_color, 0.65);
     else if (v_body >= 0.0 && abs(v_body - u_hover) < 0.5) color = mix(color, vec3(1.0), 0.22);
-    vec3 shaded = color * (0.32 + 0.68 * diffuse) + vec3(specular) + vec3(rim);
+    vec3 shaded = color * back * (0.32 + 0.68 * diffuse) + vec3(specular) * back + vec3(rim);
     frag = vec4(shaded, 1.0);
 }
 """
 
 DRAW_ORDER = (KIND_HANDLE, KIND_BOX, KIND_DEVICE, KIND_BEAM, KIND_REJECTED)
+STRIDE = 40  # ten float32 per vertex
 
 
 def perspective(fov_y_deg: float, aspect: float, near: float, far: float) -> np.ndarray:
@@ -108,8 +138,22 @@ def _compile(kind, source: str) -> int:
     return shader
 
 
+def _texture_2d(width: int, height: int, data: np.ndarray | None, existing: int = 0) -> int:
+    """(Re)create an RGBA32F texture used as a lookup table."""
+    texture = existing or GL.glGenTextures(1)
+    GL.glBindTexture(GL.GL_TEXTURE_2D, texture)
+    GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, GL.GL_NEAREST)
+    GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, GL.GL_NEAREST)
+    GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_S, GL.GL_CLAMP_TO_EDGE)
+    GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_T, GL.GL_CLAMP_TO_EDGE)
+    payload = None if data is None else np.ascontiguousarray(data, dtype=np.float32)
+    GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, GL.GL_RGBA32F, width, max(height, 1), 0, GL.GL_RGBA, GL.GL_FLOAT, payload)
+    GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
+    return texture
+
+
 class Scene3D(QOpenGLWidget):
-    """Renders the mesh of a project and animates per-vertex displacement fields."""
+    """Renders the mesh of a project and animates rigid-body motions on the GPU."""
 
     bodyClicked = Signal(int)
     hovered = Signal(int)
@@ -121,13 +165,16 @@ class Scene3D(QOpenGLWidget):
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMinimumSize(240, 200)
         self._mesh: Mesh | None = None
-        self._colors: np.ndarray | None = None
-        self._field: np.ndarray | None = None
-        self._dirty = {"mesh": False, "colors": False, "field": False}
+        self._centers = np.zeros((0, 3), dtype=np.float32)
+        self._motion = np.zeros((0, 3, 4), dtype=np.float32)
+        self._peak = 1.0
+        self._dirty = {"mesh": False, "motion": False, "colors": False}
         self._gl_ready = False
         self._program = 0
         self._vao = 0
-        self._buffers: dict[str, int] = {}
+        self._vbo = 0
+        self._ebo = 0
+        self._textures = {"motion": 0, "colors": 0}
         self._uniforms: dict[str, int] = {}
         self._visible = {kind: True for kind in range(5)}
         self._color_mode = "layer"
@@ -145,6 +192,7 @@ class Scene3D(QOpenGLWidget):
         self._amplitude = 0.04
         self._speed = 0.6
         self._caption = ""
+        self._exporting = False
         self._timer = QTimer(self)
         self._timer.setInterval(16)
         self._timer.timeout.connect(self._tick)
@@ -152,6 +200,7 @@ class Scene3D(QOpenGLWidget):
         self._click_request: QPointF | None = None
         self._hover_request: QPointF | None = None
         self._pick_fbo: QOpenGLFramebufferObject | None = None
+        self._pick_state: tuple | None = None
         self._drag_last: QPointF | None = None
         self._drag_button = None
         self._drag_moved = False
@@ -159,26 +208,29 @@ class Scene3D(QOpenGLWidget):
         self._font.setPointSize(11)
 
     # ------------------------------------------------------------- public API
-    def set_mesh(self, mesh: Mesh | None) -> None:
+    def set_mesh(self, mesh: Mesh | None, centers: np.ndarray | None = None) -> None:
+        """Show ``mesh``; ``centers`` are the bodies' centres of mass in scene units."""
         self._mesh = mesh
-        self._field = None
+        count = 0 if centers is None else len(centers)
+        self._centers = np.zeros((count, 3), dtype=np.float32) if centers is None else np.asarray(centers, dtype=np.float32)
+        self._motion = np.zeros((count, 3, 4), dtype=np.float32)
+        self._motion[:, 2, :3] = self._centers
+        self._peak = 1.0
         self._animated = False
         self._caption = ""
         self._selected = -1
         self._hover = -1
+        self._pick_state = None
         self.play(False)
         if mesh is not None and mesh.count:
             self._extent = mesh.extent
             self.reset_view()
-        self._colors = self._compute_colors()
-        self._dirty = {"mesh": True, "colors": True, "field": True}
+        self._dirty = {"mesh": True, "motion": True, "colors": True}
         self.update()
 
     def set_color_mode(self, mode: str) -> None:
         if mode != self._color_mode:
             self._color_mode = mode
-            self._colors = self._compute_colors()
-            self._dirty["colors"] = True
             self.update()
 
     def set_visible(self, kind: int, on: bool) -> None:
@@ -190,12 +242,21 @@ class Scene3D(QOpenGLWidget):
             self._selected = body
             self.update()
 
-    def set_motion(self, field: np.ndarray | None, animated: bool, caption: str = "") -> None:
-        """Show a displacement field, animated as a harmonic oscillation or held static."""
-        self._field = None if field is None else np.ascontiguousarray(field, dtype=np.float32)
-        self._animated = animated and field is not None
-        self._caption = caption if field is not None else ""
-        self._dirty["field"] = True
+    def set_motion(self, u: np.ndarray | None, theta: np.ndarray | None, animated: bool, caption: str = "") -> None:
+        """Show the rigid motion ``u`` (m) and ``theta`` (rad) per body, animated or held static."""
+        self._motion[:, 0, :] = 0.0
+        self._motion[:, 1, :] = 0.0
+        if u is not None and theta is not None and self._mesh is not None:
+            n = min(len(self._motion), len(u))
+            self._motion[:n, 0, :3] = np.asarray(u[:n], dtype=np.float64) * SCENE_UNIT
+            self._motion[:n, 1, :3] = np.asarray(theta[:n], dtype=np.float64)
+            self._peak = motion_peak(self._mesh, u[:n], theta[:n])
+            self._animated = animated
+            self._caption = caption
+        else:
+            self._animated = False
+            self._caption = ""
+        self._dirty["motion"] = True
         if self._animated:
             self._phase = math.pi / 2
             self.play(True)
@@ -204,10 +265,10 @@ class Scene3D(QOpenGLWidget):
         self.update()
 
     def clear_motion(self) -> None:
-        self.set_motion(None, False)
+        self.set_motion(None, None, False)
 
     def has_motion(self) -> bool:
-        return self._field is not None
+        return bool(self._caption)
 
     def is_animated(self) -> bool:
         return self._animated
@@ -259,24 +320,19 @@ class Scene3D(QOpenGLWidget):
     def grab_image(self):
         return self.grabFramebuffer()
 
-    # ---------------------------------------------------------------- colours
-    def _compute_colors(self) -> np.ndarray | None:
-        mesh = self._mesh
-        if mesh is None or mesh.count == 0:
-            return None
-        colors = np.empty((mesh.count, 3), dtype=np.float32)
-        for kind in range(5):
-            colors[mesh.kind == kind] = theme.GL_KIND_COLORS[kind]
-        if self._color_mode == "body":
-            structural = np.isin(mesh.kind, (KIND_DEVICE, KIND_BOX, KIND_HANDLE))
-            bodies = np.unique(mesh.body[structural])
-            for body in bodies:
-                mask = structural & (mesh.body == body)
-                tint = np.array(theme.body_rgb(int(body)), dtype=np.float32)
-                kind = mesh.kind[mask]
-                shade = np.where(kind == KIND_HANDLE, 0.55, np.where(kind == KIND_BOX, 0.8, 1.0))[:, None]
-                colors[mask] = tint * shade
-        return colors
+    def capture_frame(self, phase: float):
+        """Render the current motion at ``phase`` (radians) and return the framebuffer image."""
+        previous = (self._phase, self._exporting)
+        self._phase = phase
+        self._exporting = True
+        try:
+            return self.grabFramebuffer()
+        finally:
+            self._phase, self._exporting = previous
+
+    def frame_size(self) -> tuple[int, int]:
+        dpr = self.devicePixelRatioF()
+        return int(self.width() * dpr), int(self.height() * dpr)
 
     # --------------------------------------------------------------- GL setup
     def initializeGL(self) -> None:  # noqa: N802 - Qt API
@@ -291,61 +347,53 @@ class Scene3D(QOpenGLWidget):
         GL.glDeleteShader(vertex)
         GL.glDeleteShader(fragment)
         self._program = program
-        for name in ("u_proj", "u_view", "u_scale", "u_selected", "u_hover", "u_pick", "u_select_color"):
-            self._uniforms[name] = GL.glGetUniformLocation(program, name)
+        names = ("u_proj", "u_view", "u_scale", "u_motion", "u_body_colors", "u_kind_colors", "u_color_mode",
+                 "u_selected", "u_hover", "u_pick", "u_select_color")
+        self._uniforms = {name: GL.glGetUniformLocation(program, name) for name in names}
         self._vao = GL.glGenVertexArrays(1)
+        self._vbo = GL.glGenBuffers(1)
+        self._ebo = GL.glGenBuffers(1)
         GL.glBindVertexArray(self._vao)
-        for name in ("geometry", "field", "colors", "body"):
-            self._buffers[name] = GL.glGenBuffers(1)
+        GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self._vbo)
+        GL.glBindBuffer(GL.GL_ELEMENT_ARRAY_BUFFER, self._ebo)
+        for location, size, offset in ((0, 3, 0), (1, 3, 12), (2, 2, 24), (3, 1, 32), (4, 1, 36)):
+            GL.glEnableVertexAttribArray(location)
+            GL.glVertexAttribPointer(location, size, GL.GL_FLOAT, GL.GL_FALSE, STRIDE, ctypes.c_void_p(offset))
         GL.glBindVertexArray(0)
+        GL.glUseProgram(program)
+        colors = np.array(theme.GL_KIND_COLORS, dtype=np.float32)
+        GL.glUniform3fv(self._uniforms["u_kind_colors"], 5, colors)
+        GL.glUniform1i(self._uniforms["u_motion"], 0)
+        GL.glUniform1i(self._uniforms["u_body_colors"], 1)
+        GL.glUseProgram(0)
         self._gl_ready = True
-        self._dirty = {"mesh": True, "colors": True, "field": True}
+        self._dirty = {"mesh": True, "motion": True, "colors": True}
 
     def _upload(self) -> None:
         mesh = self._mesh
-        GL.glBindVertexArray(self._vao)
         if self._dirty["mesh"]:
             self._dirty["mesh"] = False
+            GL.glBindVertexArray(self._vao)
             if mesh is not None and mesh.count:
-                geometry = np.ascontiguousarray(np.column_stack([mesh.positions, mesh.normals]).astype(np.float32))
-                GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self._buffers["geometry"])
-                GL.glBufferData(GL.GL_ARRAY_BUFFER, geometry.nbytes, geometry, GL.GL_STATIC_DRAW)
-                GL.glEnableVertexAttribArray(0)
-                GL.glVertexAttribPointer(0, 3, GL.GL_FLOAT, GL.GL_FALSE, 24, ctypes.c_void_p(0))
-                GL.glEnableVertexAttribArray(1)
-                GL.glVertexAttribPointer(1, 3, GL.GL_FLOAT, GL.GL_FALSE, 24, ctypes.c_void_p(12))
-                body = np.ascontiguousarray(mesh.body.astype(np.float32))
-                GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self._buffers["body"])
-                GL.glBufferData(GL.GL_ARRAY_BUFFER, body.nbytes, body, GL.GL_STATIC_DRAW)
-                GL.glEnableVertexAttribArray(4)
-                GL.glVertexAttribPointer(4, 1, GL.GL_FLOAT, GL.GL_FALSE, 4, ctypes.c_void_p(0))
-                GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self._buffers["field"])
-                GL.glBufferData(GL.GL_ARRAY_BUFFER, mesh.count * 12, np.zeros((mesh.count, 3), np.float32), GL.GL_DYNAMIC_DRAW)
-                GL.glEnableVertexAttribArray(2)
-                GL.glVertexAttribPointer(2, 3, GL.GL_FLOAT, GL.GL_FALSE, 12, ctypes.c_void_p(0))
-                GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self._buffers["colors"])
-                GL.glBufferData(GL.GL_ARRAY_BUFFER, mesh.count * 12, None, GL.GL_DYNAMIC_DRAW)
-                GL.glEnableVertexAttribArray(3)
-                GL.glVertexAttribPointer(3, 3, GL.GL_FLOAT, GL.GL_FALSE, 12, ctypes.c_void_p(0))
-                self._dirty["colors"] = True
-                self._dirty["field"] = True
-        if mesh is not None and mesh.count:
-            if self._dirty["colors"]:
-                self._dirty["colors"] = False
-                colors = self._colors if self._colors is not None else self._compute_colors()
-                if colors is not None:
-                    colors = np.ascontiguousarray(colors, dtype=np.float32)
-                    GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self._buffers["colors"])
-                    GL.glBufferSubData(GL.GL_ARRAY_BUFFER, 0, colors.nbytes, colors)
-            if self._dirty["field"]:
-                self._dirty["field"] = False
-                field = self._field
-                if field is None or len(field) != mesh.count:
-                    field = np.zeros((mesh.count, 3), dtype=np.float32)
-                GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self._buffers["field"])
-                GL.glBufferSubData(GL.GL_ARRAY_BUFFER, 0, field.nbytes, field)
-        GL.glBindBuffer(GL.GL_ARRAY_BUFFER, 0)
-        GL.glBindVertexArray(0)
+                vertices = np.ascontiguousarray(mesh.vertices, dtype=np.float32)
+                indices = np.ascontiguousarray(mesh.indices, dtype=np.uint32)
+                GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self._vbo)
+                GL.glBufferData(GL.GL_ARRAY_BUFFER, vertices.nbytes, vertices, GL.GL_STATIC_DRAW)
+                GL.glBindBuffer(GL.GL_ELEMENT_ARRAY_BUFFER, self._ebo)
+                GL.glBufferData(GL.GL_ELEMENT_ARRAY_BUFFER, indices.nbytes, indices, GL.GL_STATIC_DRAW)
+            GL.glBindVertexArray(0)
+        if self._dirty["colors"]:
+            self._dirty["colors"] = False
+            count = len(self._centers)
+            table = np.ones((max(count, 1), 1, 4), dtype=np.float32)
+            for index in range(count):
+                table[index, 0, :3] = theme.body_rgb(index)
+            self._textures["colors"] = _texture_2d(1, max(count, 1), table, self._textures["colors"])
+        if self._dirty["motion"]:
+            self._dirty["motion"] = False
+            count = len(self._motion)
+            data = self._motion if count else np.zeros((1, 3, 4), dtype=np.float32)
+            self._textures["motion"] = _texture_2d(3, max(count, 1), data, self._textures["motion"])
 
     # ---------------------------------------------------------------- camera
     def _matrices(self, width: int, height: int) -> tuple[np.ndarray, np.ndarray]:
@@ -361,10 +409,10 @@ class Scene3D(QOpenGLWidget):
         return proj.astype(np.float32), view.astype(np.float32)
 
     def _current_scale(self) -> float:
-        if self._field is None:
+        if not self._caption:
             return 0.0
-        amplitude = self._amplitude * self._extent
-        if self._animated:
+        amplitude = self._amplitude * self._extent / self._peak
+        if self._animated or self._exporting:
             return amplitude * math.sin(self._phase)
         return amplitude
 
@@ -379,9 +427,10 @@ class Scene3D(QOpenGLWidget):
         painter.beginNativePainting()
         dpr = self.devicePixelRatioF()
         width, height = int(self.width() * dpr), int(self.height() * dpr)
-        if self._dirty["mesh"] or self._dirty["colors"] or self._dirty["field"]:
+        if any(self._dirty.values()):
             self._upload()
-        if self._mesh is not None and self._mesh.count and (self._click_request is not None or self._hover_request is not None):
+        has_mesh = self._mesh is not None and self._mesh.count > 0
+        if has_mesh and (self._click_request is not None or self._hover_request is not None):
             self._resolve_picks(width, height, dpr)
         GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, self.defaultFramebufferObject())
         GL.glViewport(0, 0, width, height)
@@ -389,7 +438,7 @@ class Scene3D(QOpenGLWidget):
         GL.glEnable(GL.GL_DEPTH_TEST)
         GL.glDisable(GL.GL_CULL_FACE)
         GL.glClear(GL.GL_COLOR_BUFFER_BIT | GL.GL_DEPTH_BUFFER_BIT)
-        if self._mesh is not None and self._mesh.count:
+        if has_mesh:
             self._draw(width, height, pick=False)
         GL.glBindVertexArray(0)
         GL.glUseProgram(0)
@@ -401,9 +450,14 @@ class Scene3D(QOpenGLWidget):
     def _draw(self, width: int, height: int, pick: bool) -> None:
         proj, view = self._matrices(width, height)
         GL.glUseProgram(self._program)
+        GL.glActiveTexture(GL.GL_TEXTURE0)
+        GL.glBindTexture(GL.GL_TEXTURE_2D, self._textures["motion"])
+        GL.glActiveTexture(GL.GL_TEXTURE1)
+        GL.glBindTexture(GL.GL_TEXTURE_2D, self._textures["colors"])
         GL.glUniformMatrix4fv(self._uniforms["u_proj"], 1, GL.GL_TRUE, proj)
         GL.glUniformMatrix4fv(self._uniforms["u_view"], 1, GL.GL_TRUE, view)
         GL.glUniform1f(self._uniforms["u_scale"], self._current_scale())
+        GL.glUniform1f(self._uniforms["u_color_mode"], 1.0 if self._color_mode == "body" else 0.0)
         GL.glUniform1f(self._uniforms["u_selected"], float(self._selected))
         GL.glUniform1f(self._uniforms["u_hover"], float(self._hover))
         GL.glUniform1f(self._uniforms["u_pick"], 1.0 if pick else 0.0)
@@ -415,20 +469,35 @@ class Scene3D(QOpenGLWidget):
                 continue
             start, count = self._mesh.ranges.get(kind, (0, 0))
             if count:
-                GL.glDrawArrays(GL.GL_TRIANGLES, start, count)
+                GL.glDrawElements(GL.GL_TRIANGLES, count, GL.GL_UNSIGNED_INT, ctypes.c_void_p(start * 4))
 
     def _resolve_picks(self, width: int, height: int, dpr: float) -> None:
         if self._pick_fbo is None or self._pick_fbo.size() != QSize(width, height):
             self._pick_fbo = QOpenGLFramebufferObject(QSize(width, height), QOpenGLFramebufferObject.Attachment.Depth)
+            self._pick_state = None
         fbo = self._pick_fbo
         fbo.bind()
-        GL.glViewport(0, 0, width, height)
-        GL.glClearColor(0.0, 0.0, 0.0, 1.0)
-        GL.glEnable(GL.GL_DEPTH_TEST)
-        GL.glDisable(GL.GL_CULL_FACE)
-        GL.glClear(GL.GL_COLOR_BUFFER_BIT | GL.GL_DEPTH_BUFFER_BIT)
-        self._draw(width, height, pick=True)
-        GL.glFinish()
+        state = (
+            id(self._mesh),
+            width,
+            height,
+            self._distance,
+            self._yaw,
+            self._pitch,
+            tuple(self._target),
+            self._current_scale(),
+            tuple(sorted(kind for kind, on in self._visible.items() if on)),
+        )
+        if state != self._pick_state:
+            # The ID buffer only needs re-rendering when the camera, the motion, or what is shown changed.
+            GL.glViewport(0, 0, width, height)
+            GL.glClearColor(0.0, 0.0, 0.0, 1.0)
+            GL.glEnable(GL.GL_DEPTH_TEST)
+            GL.glDisable(GL.GL_CULL_FACE)
+            GL.glClear(GL.GL_COLOR_BUFFER_BIT | GL.GL_DEPTH_BUFFER_BIT)
+            self._draw(width, height, pick=True)
+            GL.glFinish()
+            self._pick_state = state
 
         def read(pos: QPointF) -> int:
             x = int(pos.x() * dpr)
@@ -466,7 +535,6 @@ class Scene3D(QOpenGLWidget):
             painter.setFont(font)
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Extract a structure to build the 3D model")
             return
-        # Axis gizmo.
         _, view = self._matrices(self.width(), self.height())
         rotation = view[:3, :3]
         origin = QPointF(44.0, self.height() - 44.0)
@@ -478,11 +546,11 @@ class Scene3D(QOpenGLWidget):
             painter.setPen(QPen(QColor(color), 2.0))
             painter.drawLine(origin, tip)
             painter.drawText(tip + QPointF(v[0] * 8.0 - 4.0, -v[1] * 8.0 + 4.0), label)
+        rect = self.rect().adjusted(12, 10, -12, -10)
         if self._caption:
             painter.setPen(QColor(theme.TEXT))
-            rect = self.rect().adjusted(12, 10, -12, -10)
             painter.drawText(rect, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop, self._caption)
-            if self._animated:
+            if self._animated and not self._exporting:
                 painter.setPen(QColor(theme.MUTED))
                 state = "playing" if self._playing else "paused"
                 painter.drawText(rect.adjusted(0, 18, 0, 0), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop, f"{state} · amplitude {self._amplitude * 100:.1f}% of extent")
@@ -497,8 +565,9 @@ class Scene3D(QOpenGLWidget):
     def mouseMoveEvent(self, event) -> None:  # noqa: N802 - Qt API
         pos = event.position()
         if self._drag_last is None:
-            self._hover_request = pos
-            self.update()
+            if not self._playing:  # picking re-renders the ID buffer; skip it while animating
+                self._hover_request = pos
+                self.update()
             return
         delta = pos - self._drag_last
         self._drag_last = pos

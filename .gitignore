@@ -6,3 +6,9 @@ build/
 dist/
 .DS_Store
 .ruff_cache/
+smoke*.png
+smoke_test.png
+ConnFlex-*.dmg
+ConnFlex-*.zip
+ConnFlex-*.tar.gz
+.pytest_cache/

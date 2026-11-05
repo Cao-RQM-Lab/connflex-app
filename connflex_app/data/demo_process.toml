@@ -1,0 +1,20 @@
+# Process description for demo_resonator.gds (SI units).
+[stack.device]
+thickness = 25e-6
+material = "silicon"
+
+[stack.box]
+thickness = 2e-6
+material = "oxide"
+
+[stack.handle]
+thickness = 400e-6
+material = "silicon"
+
+[extraction]
+release_hole_max_area = 100e-12
+release_distance = 5e-6
+body_min_width = 10e-6
+
+[solve]
+method = "dense"

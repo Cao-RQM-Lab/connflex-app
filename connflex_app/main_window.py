@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import time
 
@@ -16,7 +17,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QApplication,
-    QProgressBar,
+    QDialog,
     QSizePolicy,
     QSplitter,
     QToolBar,
@@ -28,8 +29,9 @@ from connflex_core.mechanics.assembly import assemble
 from connflex_core.progress import stage
 
 from connflex_app import __version__, theme
-from connflex_app.analysis import static_response
+from connflex_app.analysis import free_bodies, rigid_mode_count, static_response
 from connflex_app.gds_io import GdsInfo, inspect_gds, load_layout
+from connflex_app.gif_export import encode_gif, frame_from_qimage
 from connflex_app.geometry import (
     DOF_ORDER,
     DOF_SHORT,
@@ -38,27 +40,30 @@ from connflex_app.geometry import (
     KIND_DEVICE,
     KIND_HANDLE,
     KIND_REJECTED,
+    body_centers,
     build_mesh,
-    describe_motion,
-    displacement_field,
-    gyration_radii,
+    closed_plates,
+    describe_modes,
     motion_from_vector,
-    normalized,
-    perforate,
     release_holes,
 )
+from connflex_app.render2d import prepare_layout, prepare_project
 from connflex_app.session import Project, Session
 from connflex_app.settings import Settings
 from connflex_app.units import fmt_freq
 from connflex_app.widgets.chips import ChipBar, OverlayHost
+from connflex_app.widgets.gif_dialog import GifExportDialog
 from connflex_app.widgets.layout_view import LayoutView
 from connflex_app.widgets.modes_panel import ModesPanel
+from connflex_app.widgets.progress_status import ProgressStatus
 from connflex_app.widgets.scene3d import Scene3D
 from connflex_app.widgets.setup_panel import SetupPanel
 from connflex_app.widgets.stiffness_panel import StiffnessPanel
 from connflex_app.workers import ProgressRelay, Worker
 
 SCENE_KINDS = {"device": KIND_DEVICE, "box": KIND_BOX, "handle": KIND_HANDLE, "beams": KIND_BEAM, "rejected": KIND_REJECTED}
+EXTRACT_STAGES = ("load", "heal", "release", "prune", "nets", "opening", "bodies", "candidates", "beams", "mass", "mesh", "assemble", "prepare")
+MODAL_STAGES = ("assemble", "solve")
 
 
 def run_extraction(path: str, settings: Settings, progress, bounds=None) -> Project:
@@ -73,13 +78,18 @@ def run_extraction(path: str, settings: Settings, progress, bounds=None) -> Proj
     structure = cf.extract(layout, stack, params, progress=progress)
     timings["extract"] = time.perf_counter() - started
     started = time.perf_counter()
-    with stage("mesh", progress):
+    bodies, beams = len(structure.bodies), len(structure.beams)
+    cache: dict = {}
+    with stage("mesh", progress, total=bodies + beams) as current:
         holes = release_holes(layout, params.release_hole_max_area)
-        plates = perforate(structure, holes)
-        mesh = build_mesh(structure, stack, plates)
+        plates = closed_plates(structure)
+        mesh = build_mesh(structure, stack, plates, advance=current.advance, cache=cache)
     timings["mesh"] = time.perf_counter() - started
     with stage("assemble", progress):
         system = assemble(structure)
+    with stage("prepare", progress, total=bodies) as current:
+        render = prepare_project(layout, structure, plates, holes, advance=current.advance, cache=cache)
+    del cache
     return Project(
         path=path,
         settings=settings,
@@ -91,6 +101,7 @@ def run_extraction(path: str, settings: Settings, progress, bounds=None) -> Proj
         plates=plates,
         mesh=mesh,
         system=system,
+        render=render,
         timings=timings,
     )
 
@@ -113,8 +124,6 @@ class MainWindow(QMainWindow):
         self._info: GdsInfo | None = None
         self._path: str | None = None
         self._progress = ProgressRelay(self)
-        self._progress.stageStarted.connect(self._stage_started)
-        self._progress.advanced.connect(self._stage_advanced)
         self._build_views()
         self._build_docks()
         self._build_toolbar()
@@ -168,6 +177,8 @@ class MainWindow(QMainWindow):
         self.play_button.setEnabled(False)
         self.playback_caption = self.playback_bar.add_label("No motion selected")
         self.playback_bar.add_separator()
+        self.gif_button = self.playback_bar.add_button("GIF…", self.export_gif_dialog, "Export one cycle of this animation as a GIF")
+        self.gif_button.setEnabled(False)
         self.playback_bar.add_button("Clear", self._clear_motion, "Show the undeformed structure")
         self.view3d.add_overlay(self.playback_bar, "bottom-center")
 
@@ -259,8 +270,12 @@ class MainWindow(QMainWindow):
         self.act_export_modes = QAction("Export modes as NPZ…", self)
         self.act_export_modes.setEnabled(False)
         self.act_export_modes.triggered.connect(self.export_modes)
+        self.act_export_gif = QAction("Export animation as GIF…", self)
+        self.act_export_gif.setEnabled(False)
+        self.act_export_gif.triggered.connect(self.export_gif_dialog)
         file_menu.addAction(self.act_export_structure)
         file_menu.addAction(self.act_export_modes)
+        file_menu.addAction(self.act_export_gif)
         file_menu.addSeparator()
         quit_action = QAction("Quit", self)
         quit_action.setShortcut(QKeySequence.StandardKey.Quit)
@@ -276,21 +291,24 @@ class MainWindow(QMainWindow):
         view_menu.addAction(self.act_fit)
         view_menu.addAction(self.act_reset)
         help_menu = menu.addMenu("&Help")
+        demo = QAction("Open demo layout", self)
+        demo.triggered.connect(self.open_demo)
+        help_menu.addAction(demo)
         about = QAction("About ConnFlex", self)
         about.triggered.connect(self._about)
         help_menu.addAction(about)
 
     def _build_statusbar(self) -> None:
-        self.status_label = QLabel("Open a GDS file to begin.")
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setFixedWidth(180)
-        self.progress_bar.setTextVisible(False)
-        self.progress_bar.setVisible(False)
+        self.progress = ProgressStatus()
+        self.progress.set_message("Open a GDS file to begin.")
+        self.status_label = self.progress.message
+        self._progress.stageStarted.connect(self.progress.stage_started)
+        self._progress.advanced.connect(self.progress.advanced)
+        self._progress.stageFinished.connect(self.progress.stage_finished)
         self.hover_label = QLabel("")
         self.hover_label.setObjectName("muted")
         bar = self.statusBar()
-        bar.addWidget(self.status_label)
-        bar.addWidget(self.progress_bar)
+        bar.addWidget(self.progress, 1)
         bar.addPermanentWidget(self.hover_label)
 
     def _wire(self) -> None:
@@ -395,7 +413,7 @@ class MainWindow(QMainWindow):
         worker.failed.connect(failed)
         worker.start()
 
-    def _set_busy(self, busy: bool, phase: str = "") -> None:
+    def _set_busy(self, busy: bool, phase: str = "", stages: tuple[str, ...] = ()) -> None:
         self._busy = busy
         self._phase = phase
         self.setup.set_busy(busy)
@@ -403,19 +421,10 @@ class MainWindow(QMainWindow):
         self.act_extract.setEnabled(not busy and self._info is not None)
         self.act_solve.setEnabled(not busy and self.session.project is not None)
         self.modes.solve_button.setEnabled(not busy and self.session.project is not None)
-        self.progress_bar.setVisible(busy)
         if busy:
-            self.progress_bar.setRange(0, 0)
-            self.status_label.setText(phase + "…")
-
-    def _stage_started(self, name: str, total) -> None:
-        self.progress_bar.setRange(0, int(total) if total else 0)
-        self.progress_bar.setValue(0)
-        self.status_label.setText(f"{self._phase} · {name}…")
-
-    def _stage_advanced(self, count: int) -> None:
-        if self.progress_bar.maximum():
-            self.progress_bar.setValue(min(count, self.progress_bar.maximum()))
+            self.progress.start_phase(phase, stages)
+        else:
+            self.progress.finish_phase()
 
     def _failed(self, title: str, message: str, trace: str) -> None:
         self._set_busy(False)
@@ -433,11 +442,18 @@ class MainWindow(QMainWindow):
         if path:
             self.open_path(path)
 
+    def open_demo(self) -> None:
+        """Open the resonator layout that ships with the application."""
+        from connflex_app.data import demo_gds
+
+        self.open_path(str(demo_gds()))
+
     def open_path(self, path: str) -> None:
         if self._busy:
             return
         path = os.path.abspath(path)
-        self._set_busy(True, f"Reading {os.path.basename(path)}")
+        self._set_busy(True, f"Reading {os.path.basename(path)}", ("inspect",))
+        self.progress.stage_started("inspect", None)
         self._run(lambda: inspect_gds(path), lambda info: self._inspected(path, info), "Could not read the GDS file")
 
     def _inspected(self, path: str, info: GdsInfo) -> None:
@@ -466,11 +482,21 @@ class MainWindow(QMainWindow):
         except ValueError:
             return
         path, bounds = self._path, self._info.bounds_m(settings.cell)
-        self._run(lambda: load_layout(path, settings, bounds), self._previewed, "Could not read the layers")
+        if not self._busy:
+            self.progress.set_message("Loading the layer preview…")
 
-    def _previewed(self, layout) -> None:
+        def load():
+            layout = load_layout(path, settings, bounds)
+            return layout, prepare_layout(layout)
+
+        self._run(load, self._previewed, "Could not read the layers")
+
+    def _previewed(self, result) -> None:
+        layout, render = result
         if self.session.project is None:
-            self.layout_view.set_layout(layout)
+            self.layout_view.set_layout(layout, render)
+            if not self._busy:
+                self.progress.set_message("Layer preview ready. Check the layer roles, then extract.")
 
     def load_config(self) -> None:
         directory = self._qsettings.value("lastDir", os.path.expanduser("~"))
@@ -499,7 +525,7 @@ class MainWindow(QMainWindow):
             return
         self._remember(self._path, settings)
         self.scene.clear_motion()
-        self._set_busy(True, "Extracting")
+        self._set_busy(True, "Extracting", EXTRACT_STAGES)
         path = self._path
         bounds = self._info.bounds_m(settings.cell) if self._info is not None else None
         self._run(lambda: run_extraction(path, settings, self._progress, bounds), self._extracted, "Extraction failed")
@@ -511,7 +537,8 @@ class MainWindow(QMainWindow):
         rejected = sum(1 for c in structure.rejected if len(c.bodies) != 1)
         self.status_label.setText(
             f"Extracted {len(structure.bodies)} bodies, {len(structure.beams)} beams, {rejected} rejected candidates, "
-            f"{structure.nets.count} electrical nets in {project.timings.get('extract', 0.0):.2f} s."
+            f"{structure.nets.count} electrical nets in {project.timings.get('extract', 0.0):.2f} s · "
+            f"3D mesh {project.mesh.triangles:,} triangles."
         )
         self.solve()
 
@@ -524,7 +551,7 @@ class MainWindow(QMainWindow):
         except ValueError as exc:
             QMessageBox.warning(self, "Check the solve options", str(exc))
             return
-        self._set_busy(True, "Solving modes")
+        self._set_busy(True, "Solving modes", MODAL_STAGES)
         started = time.perf_counter()
         self._run(
             lambda: (project.structure.modal(options, progress=self._progress), time.perf_counter() - started),
@@ -539,23 +566,33 @@ class MainWindow(QMainWindow):
         if project is None:
             return
         self.session.set_modal(modal)
-        labels = []
-        radii = gyration_radii(project.structure)
-        for k in range(modal.modes.shape[1]):
-            u, theta = motion_from_vector(project.structure, modal.dofs, modal.modes[:, k])
-            labels.append(describe_motion(project.structure, u, theta, radii)[0])
-        self.modes.set_modal(modal, labels, elapsed)
+        hidden = min(rigid_mode_count(project.structure), len(modal.frequencies_hz))
+        free = free_bodies(project.structure)
+        labels = describe_modes(project.structure, modal.dofs, modal.modes[:, hidden:])
+        self.modes.set_modal(modal, labels, elapsed, hidden=hidden, free=free)
         self.act_export_modes.setEnabled(True)
         took = f"{elapsed * 1000:.0f} ms" if elapsed < 1.0 else f"{elapsed:.2f} s"
-        self.status_label.setText(f"Solved {len(modal.frequencies_hz)} modes in {took}. First mode at {fmt_freq(float(modal.frequencies_hz[0]))}.")
-        self.modes.select_mode(0)
-        self._mode_selected(0)
+        shown = len(modal.frequencies_hz) - hidden
+        text = f"Solved {len(modal.frequencies_hz)} modes in {took}."
+        if hidden:
+            text += f" {hidden} rigid-body modes of {len(free)} free bod{'y' if len(free) == 1 else 'ies'} hidden."
+        if shown > 0:
+            text += f" First mode at {fmt_freq(float(modal.frequencies_hz[hidden]))}."
+            self.status_label.setText(text)
+            self.modes.select_mode(hidden)
+            self._mode_selected(hidden)
+        else:
+            self.status_label.setText(text)
+            self._clear_motion()
 
     # ----------------------------------------------------------------- display
     def _project_changed(self) -> None:
         project = self.session.project
         self.layout_view.set_project(project)
-        self.scene.set_mesh(project.mesh if project is not None else None)
+        if project is not None:
+            self.scene.set_mesh(project.mesh, body_centers(project.structure))
+        else:
+            self.scene.set_mesh(None)
         self.modes.set_project(project)
         self.modes.set_modal(None, [])
         self.stiffness.set_project(project)
@@ -586,9 +623,8 @@ class MainWindow(QMainWindow):
             return
         modal = project.modal
         u, theta = motion_from_vector(project.structure, modal.dofs, modal.modes[:, index])
-        field = normalized(displacement_field(project.mesh, project.structure, u, theta))
         caption = f"Mode {index + 1} · {fmt_freq(float(modal.frequencies_hz[index]))}"
-        self.scene.set_motion(field, animated=True, caption=caption)
+        self.scene.set_motion(u, theta, animated=True, caption=caption)
         self._set_caption(caption)
 
     def _show_deflection(self, body: int, dof: int, fixed) -> None:
@@ -601,10 +637,9 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Could not compute the deflection", str(exc))
             return
         u, theta = motion_from_vector(project.structure, project.system.dofs, vector)
-        field = normalized(displacement_field(project.mesh, project.structure, u, theta))
-        caption = f"Deflection · unit force on body {body} along {DOF_SHORT[DOF_ORDER[dof]]}"
+        caption = f"Deflection · body {body} · unit {DOF_SHORT[DOF_ORDER[dof]]} load"
         self.modes.select_mode(-1)
-        self.scene.set_motion(field, animated=False, caption=caption)
+        self.scene.set_motion(u, theta, animated=False, caption=caption)
         self._set_caption(caption)
         if not self.view3d.isVisible():
             self.view_actions["split"].trigger()
@@ -617,6 +652,8 @@ class MainWindow(QMainWindow):
     def _set_caption(self, text: str) -> None:
         self.playback_caption.setText(text)
         self.play_button.setEnabled(self.scene.is_animated())
+        self.gif_button.setEnabled(self.scene.has_motion())
+        self.act_export_gif.setEnabled(self.scene.has_motion())
         self._playing_changed(self.scene.is_playing())
         self.view3d._place()
 
@@ -678,6 +715,44 @@ class MainWindow(QMainWindow):
             return
         project.modal.to_npz(path)
         self.status_label.setText(f"Exported modes to {os.path.basename(path)}.")
+
+    def export_gif_dialog(self) -> None:
+        if not self.scene.has_motion() or self._busy:
+            return
+        suggested = GifExportDialog.suggest_path(self._path, self.playback_caption.text())
+        dialog = GifExportDialog(self, suggested, self.scene.frame_size())
+        if dialog.exec() != int(QDialog.DialogCode.Accepted) or not dialog.path:
+            return
+        frames, fps, scale = dialog.values()
+        self.export_gif(dialog.path, frames=frames, fps=fps, scale=scale)
+
+    def export_gif(self, path: str, frames: int = 36, fps: int = 24, scale: float = 1.0) -> None:
+        """Capture one cycle of the current motion from the 3D view and write it to ``path``."""
+        if not self.scene.has_motion() or self._busy:
+            return
+        was_playing = self.scene.is_playing()
+        self.scene.play(False)
+        self._set_busy(True, "Exporting GIF", ("frames", "encode"))
+        self.progress.stage_started("frames", frames)
+        captured = []
+        for index in range(frames):
+            image = self.scene.capture_frame(2.0 * math.pi * index / frames)
+            captured.append(frame_from_qimage(image, scale))
+            self.progress.advanced(index + 1)
+            QApplication.processEvents()
+        self.progress.stage_finished("frames")
+        width, height = captured[0][1], captured[0][2]
+
+        def encode() -> int:
+            with stage("encode", self._progress, total=len(captured)) as current:
+                return encode_gif(captured, path, fps, advance=current.advance)
+
+        def done(size: int) -> None:
+            self._set_busy(False)
+            self.scene.play(was_playing)
+            self.status_label.setText(f"Saved {frames} frames ({width} × {height} px, {size / 1e6:.1f} MB) to {os.path.basename(path)}.")
+
+        self._run(encode, done, "Could not write the GIF")
 
     def _about(self) -> None:
         QMessageBox.about(
