@@ -20,7 +20,7 @@ jobs:
             label: linux-x64
           - os: windows-latest
             label: windows-x64
-          - os: macos-14
+          - os: macos-15  # arm64; GitHub retired the macos-14 runners on 2026-11-02
             label: macos-arm64
     steps:
       - uses: actions/checkout@v4
