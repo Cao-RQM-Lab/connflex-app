@@ -60,11 +60,13 @@ class Settings:
     handle: tuple[int, int] | None = None
     release: tuple[int, int] | None = None
     vias: tuple[int, int] | None = None
+    box: tuple[int, int] | None = None
     cell: str | None = None
     invert_device: bool = False
     invert_handle: bool = False
     invert_release: bool = False
     invert_vias: bool = False
+    invert_box: bool = False
 
     stack_device: LayerSettings = field(default_factory=lambda: LayerSettings(25e-6, replace(SILICON)))
     stack_box: LayerSettings = field(default_factory=lambda: LayerSettings(2e-6, replace(OXIDE)))
@@ -87,7 +89,7 @@ class Settings:
 
     def inverted_roles(self) -> set[str]:
         """Roles whose layer is replaced by its complement within the cell bounds."""
-        return {role for role in ("device", "handle", "release", "vias") if getattr(self, f"invert_{role}")}
+        return {role for role in ("device", "handle", "release", "vias", "box") if getattr(self, f"invert_{role}")}
 
     def layer_map(self) -> LayerMap:
         if self.device is None or self.handle is None:
@@ -144,7 +146,7 @@ class Settings:
             if key.startswith("stack_") and isinstance(value, dict):
                 material = MaterialSettings(**value.get("material", {}))
                 value = LayerSettings(thickness=float(value["thickness"]), material=material)
-            elif key in ("device", "handle", "release", "vias") and value is not None:
+            elif key in ("device", "handle", "release", "vias", "box") and value is not None:
                 value = (int(value[0]), int(value[1]))
             elif key == "anchor" and isinstance(value, list):
                 value = (float(value[0]), float(value[1]))

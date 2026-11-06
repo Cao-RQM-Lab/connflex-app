@@ -105,6 +105,8 @@ wait_until(
 )
 pump(900)
 shot("02_extracted_mode1_playing.png")
+shot("02b_status_after_solve.png", window.statusBar())
+print("timings kept:", window.progress.summary.isVisible(), "|", [(t, round(s, 3), len(st)) for t, s, st, ok in window.progress.history()])
 print("structure:", len(window.session.project.structure.bodies), "bodies,", len(window.session.project.structure.beams), "beams, mesh", f"{window.session.project.mesh.count:,}", "verts; timings", {k: round(v, 2) for k, v in window.session.project.timings.items()})
 
 # GPU zoom: every step is a matrix change, so each paint must be quick even on large layouts.
@@ -149,6 +151,14 @@ window.scene.play(False)
 window.scene._phase = math.pi / 2
 pump(250)
 shot("06_3d_mode2_peak.png", window.scene)
+
+import gdstk  # noqa: E402
+
+for separate in (True, False):
+    gds_path = os.path.join(out, f"released_{'separate' if separate else 'holes'}.gds")
+    window.export_gds_file(gds_path, separate)
+    wait_until(lambda: not window._busy, what="gds export")
+    print("gds export:", "separate" if separate else "holes", sorted(gdstk.read_gds(gds_path).layers_and_datatypes()), "|", window.status_label.text())
 
 gif_path = os.path.join(out, "mode2.gif")
 window.export_gif(gif_path, frames=12, fps=20, scale=0.5)

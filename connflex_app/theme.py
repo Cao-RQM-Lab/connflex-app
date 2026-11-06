@@ -141,6 +141,10 @@ QFrame#vsep {{ background: {BORDER}; }}
 QToolButton#section {{ background: transparent; border: none; color: {MUTED}; font-weight: 600; padding: 2px; }}
 QToolButton#section:hover {{ color: {TEXT}; }}
 QCheckBox {{ spacing: 6px; }}
+QRadioButton {{ spacing: 8px; }}
+QRadioButton::indicator {{ width: 12px; height: 12px; border-radius: 8px; border: 2px solid #5c6373; background: {BG}; }}
+QRadioButton::indicator:hover {{ border-color: {MUTED}; }}
+QRadioButton::indicator:checked {{ border: 2px solid {ACCENT}; background: qradialgradient(cx:0.5, cy:0.5, radius:0.5, fx:0.5, fy:0.5, stop:0 {ACCENT}, stop:0.55 {ACCENT}, stop:0.62 {BG}, stop:1 {BG}); }}
 QFrame#card {{ background: {PANEL}; border: 1px solid {BORDER}; border-radius: 8px; }}
 """
 

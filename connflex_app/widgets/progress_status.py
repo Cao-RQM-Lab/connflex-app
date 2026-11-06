@@ -18,8 +18,16 @@ def _duration(seconds: float) -> str:
     return f"{int(seconds // 60)} min {seconds % 60:.0f} s"
 
 
+HISTORY_SHOWN = 4
+
+
 class ProgressStatus(QWidget):
-    """Shows what a long operation is doing: which stage, how far along, and for how long."""
+    """Shows what a long operation is doing: which stage, how far along, and for how long.
+
+    When an operation ends, its total time joins a summary of recent operations that stays in
+    the bar (for example "Extracting 2.3 s · Solving modes 12 ms"); hovering it lists the time
+    of every stage. Opening a file or extracting again starts a new summary.
+    """
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -39,8 +47,12 @@ class ProgressStatus(QWidget):
         self.elapsed = QLabel()
         self.elapsed.setObjectName("muted")
         self.elapsed.setMinimumWidth(64)
+        self.summary = QLabel()
+        self.summary.setTextFormat(Qt.TextFormat.RichText)
+        self.summary.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         layout.addWidget(self.message)
         layout.addWidget(self.trail, 1)
+        layout.addWidget(self.summary, 1)
         layout.addWidget(self.bar)
         layout.addWidget(self.percent)
         layout.addWidget(self.elapsed)
@@ -54,10 +66,16 @@ class ProgressStatus(QWidget):
         self._count = 0
         self._phase_started = 0.0
         self._stage_started = 0.0
+        self._title: str | None = None
+        self._history: list[tuple[str, float, list[tuple[str, float]], bool]] = []
         self._show_progress(False)
 
     # ---------------------------------------------------------------- phases
-    def start_phase(self, title: str, stages: tuple[str, ...] = ()) -> None:
+    def start_phase(self, title: str, stages: tuple[str, ...] = (), reset: bool = False) -> None:
+        """Begin ``title``; ``reset`` clears the summary of earlier operations (a new file or extraction)."""
+        if reset:
+            self._history.clear()
+        self._title = title
         self.message.setText(f"<b>{title}</b>")
         self._stages = list(stages)
         self._done = {}
@@ -88,11 +106,26 @@ class ProgressStatus(QWidget):
             self._current = None
         self._refresh()
 
-    def finish_phase(self, message: str | None = None) -> None:
+    def finish_phase(self, message: str | None = None, ok: bool = True) -> None:
+        """End the current operation and add its timings to the summary."""
         self._timer.stop()
+        if self._title is not None:
+            now = time.perf_counter()
+            if self._current is not None and self._current not in self._done:
+                self._done[self._current] = now - self._stage_started  # a stage that was never closed
+            stages = [(name, self._done[name]) for name in self._stages if name in self._done]
+            self._history = [entry for entry in self._history if entry[0] != self._title]
+            self._history.append((self._title, now - self._phase_started, stages, ok))
+            self._title = None
+            self._current = None
         self._show_progress(False)
+        self._render_summary()
         if message is not None:
             self.message.setText(message)
+
+    def history(self) -> list[tuple[str, float, list[tuple[str, float]], bool]]:
+        """Recent operations as (title, total seconds, [(stage, seconds)], succeeded), oldest first."""
+        return list(self._history)
 
     def set_message(self, text: str) -> None:
         self.message.setText(text)
@@ -101,6 +134,22 @@ class ProgressStatus(QWidget):
     def _show_progress(self, on: bool) -> None:
         for widget in (self.trail, self.bar, self.percent, self.elapsed):
             widget.setVisible(on)
+        self.summary.setVisible(not on and bool(self._history))
+
+    def _render_summary(self) -> None:
+        recent = self._history[-HISTORY_SHOWN:]
+        parts, tips = [], []
+        for title, total, stages, ok in recent:
+            if ok:
+                parts.append(f'<span style="color:{theme.MUTED}">{title}</span> {_duration(total)}')
+            else:
+                parts.append(f'<span style="color:{theme.DANGER}">{title} failed after {_duration(total)}</span>')
+            lines = [f"{title}: {_duration(total)}" + ("" if ok else " (failed)")]
+            lines += [f"    {name}  {_duration(seconds)}" for name, seconds in stages]
+            tips.append("\n".join(lines))
+        self.summary.setText(" · ".join(parts))
+        self.summary.setToolTip("\n\n".join(tips))
+        self.summary.setVisible(bool(recent) and not self.bar.isVisible())
 
     def _refresh(self) -> None:
         now = time.perf_counter()

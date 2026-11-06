@@ -13,6 +13,11 @@ plus the layout's electrical nets. Then:
 - **3D view**: the whole stack extruded (device, surviving buried oxide, handle), with every
   resonant mode animated live. Orbit with the left mouse button, pan with the right or middle
   button, zoom with the wheel. Click a body to select it.
+- **GDS export**: File → Export GDS writes the extracted, released structure: 1/0 device,
+  2/0 release holes, 3/0 surviving buried oxide, 4/0 handle. Release holes can go on their
+  own layer (device drawn filled) or stay cut into the device (2/0 left empty). The release
+  openings are the ones connflex-core removed from body mass, and re-extracting the exported
+  file reproduces the same structure.
 - **Modes**: resonant frequencies listed from low to high with the dominant motion of each;
   select one to animate it, tune amplitude and speed, and export one cycle as a looping GIF
   (playback bar or File → Export animation as GIF).
@@ -39,7 +44,7 @@ source venv/bin/activate
 pip install -e .
 ```
 
-This pulls in `connflex-core[gds]` (gdstk reader), PySide6, PyOpenGL, numpy and shapely.
+This pulls in `connflex-core[gds]` (gdstk reader), PySide6, PyOpenGL, Pillow, numpy and shapely.
 
 ## Run
 
@@ -58,6 +63,10 @@ connflex-app examples/demo_resonator.gds
 Its process description is in `examples/demo_process.toml` and can be loaded from the Setup
 panel ("Load process config"). Layer roles are guessed from the file (1/0 device, 2/0 handle,
 3/0 release, 4/0 vias by convention, otherwise by area) and can be changed before extraction.
+The optional **Box** role takes the surviving buried oxide from a drawn layer instead of
+computing it from the release holes, the release layer, and the release distance (which is
+then unused). The drawn box is clipped to where device and handle silicon overlap and to
+outside release openings; release holes and the release layer still remove device mass.
 Tick **Invert** next to a role when that layer is drawn as etch openings rather than remaining
 material: the role then uses the complement of the drawn polygons within the cell's bounding
 box. The 2D view previews the result immediately.
@@ -79,9 +88,12 @@ the camera, and `Space` to pause and resume the animation.
 
 Loading, extraction, meshing, and the modal solve run on worker threads; the status bar shows
 the current stage, step counts, per-stage timings, an overall percentage, and the elapsed
-time. Both views render with OpenGL: every layer is triangulated once in the worker and kept
-in GPU buffers, so panning, zooming, and orbiting only change a matrix and stay smooth on
-large layouts. Buffers are rebuilt only when the data or the display options change. Mode
+time. When an operation finishes, its total stays in the status bar next to the previous ones
+(hover for the per-stage times) until the next file is opened or extracted.
+
+Both views render with OpenGL: every layer is triangulated once in the worker and kept in GPU
+buffers, so panning, zooming, and orbiting only change a matrix and stay smooth on large
+layouts. Buffers are rebuilt only when the data or the display options change. Mode
 shapes and deflections are applied on the GPU from per-body transforms, so switching modes
 is instant whatever the mesh size.
 
@@ -109,15 +121,17 @@ workflow does, `make dist` chains those three, and `make clean` removes every bu
 Builds are produced by `.github/workflows/release.yml` with PyInstaller (see
 `packaging/README.md`). The version is never written in the source: setuptools-scm derives
 it from the git tag (`vX.Y.Z` gives `X.Y.Z`; later commits give `X.Y.Z+1.devN+g<sha>`), and
-`connflex_app.__version__` reports it at runtime. To publish a release, tag and push:
+`connflex_app.__version__` reports it at runtime. To publish a release, add a section for
+the version to `CHANGELOG.md` (it becomes the release notes), commit, then tag and push:
 
 ```sh
 git tag v0.1.2
-git push origin v0.1.2
+git push origin main v0.1.2
 ```
 
 With Docker and [act](https://github.com/nektos/act) installed, `make act-ci` runs the CI
 workflow locally and `make act-release` runs the Linux build job of the release workflow,
-both emulating the x64 GitHub runner. The workflow builds and self-tests the bundle on all three platforms, then attaches
-`ConnFlex-<version>-linux-x64.tar.gz`, `-windows-x64.zip`, `-macos-arm64.dmg`, and a
-`SHA256SUMS.txt` to the release. `workflow_dispatch` builds the artifacts without publishing.
+both emulating the x64 GitHub runner. The workflow builds and self-tests the bundle on all
+three platforms, then attaches `ConnFlex-<version>-linux-x64.tar.gz`, `-windows-x64.zip`,
+`-macos-arm64.dmg`, and a `SHA256SUMS.txt` to the release. `workflow_dispatch` builds the
+artifacts without publishing.

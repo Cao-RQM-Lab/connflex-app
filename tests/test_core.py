@@ -52,7 +52,7 @@ def project():
 def test_inspection_and_role_guess():
     info = inspect_gds(str(demo_gds()))
     assert info.top_cells == ["RESONATOR"]
-    assert guess_roles(info.layers(None)) == {"device": (1, 0), "handle": (2, 0), "release": (3, 0), "vias": (4, 0)}
+    assert guess_roles(info.layers(None)) == {"device": (1, 0), "handle": (2, 0), "release": (3, 0), "vias": (4, 0), "box": None}
     assert info.bounds_m(None) == pytest.approx((0.0, 0.0, 1.2e-3, 1.2e-3))
 
 

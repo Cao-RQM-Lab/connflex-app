@@ -77,6 +77,7 @@ class RenderData:
     beam_counts: dict[int, int] = field(default_factory=dict)
     free_bodies: set[int] = field(default_factory=set)
     holes: MultiPolygon | None = None
+    box_layer: MultiPolygon | None = None
 
     @property
     def origin_m(self) -> NDArray[np.float64]:
@@ -107,10 +108,16 @@ def _origin(layout: Layout) -> NDArray[np.float64]:
 
 
 def prepare_layout(
-    layout: Layout, advance: Callable[[], None] | None = None, cache: TriangleCache | None = None
+    layout: Layout,
+    advance: Callable[[], None] | None = None,
+    cache: TriangleCache | None = None,
+    box: MultiPolygon | None = None,
 ) -> RenderData:
-    """Render data for the raw layers of a layout (the preview before extraction)."""
+    """Render data for the raw layers of a layout (the preview before extraction), with a drawn box layer if given."""
     data = RenderData(origin=_origin(layout), cache=cache)
+    if box is not None and not box.is_empty:
+        data.box_layer = box
+        data.register(box)
     for geometry in (layout.handle, layout.device, layout.release, layout.vias):
         if geometry is not None:
             data.register(geometry)

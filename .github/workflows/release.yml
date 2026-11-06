@@ -136,6 +136,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-22.04
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -145,10 +146,19 @@ jobs:
           cd artifacts
           sha256sum ConnFlex-* > SHA256SUMS.txt
           cat SHA256SUMS.txt
+      - name: Release notes from CHANGELOG.md
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          awk -v version="$VERSION" '/^## / { if (found) exit; found = ($2 == version); next } found' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "::warning::CHANGELOG.md has no section for $VERSION; the release gets generated notes only"
+          fi
+          cat release-notes.md
       - uses: softprops/action-gh-release@v2
         with:
           name: ConnFlex ${{ github.ref_name }}
-          generate_release_notes: true
+          body_path: release-notes.md
+          generate_release_notes: true  # appended after the CHANGELOG section
           files: |
             artifacts/ConnFlex-*.tar.gz
             artifacts/ConnFlex-*.zip

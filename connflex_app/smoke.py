@@ -25,9 +25,18 @@ class SmokeTest(QObject):
         self._started = time.monotonic()
         self._settled_at: float | None = None
         self._gif_path = ""
+        self._gds_path = ""
         self._timer = QTimer(self)
         self._timer.setInterval(100)
         self._timer.timeout.connect(self._tick)
+
+    def _gds_layers(self) -> list[tuple[int, int]]:
+        try:
+            import gdstk
+
+            return sorted(gdstk.read_gds(self._gds_path).layers_and_datatypes())
+        except Exception:  # noqa: BLE001 - reported as a failure
+            return []
 
     def start(self) -> None:
         self._timer.start()
@@ -59,6 +68,11 @@ class SmokeTest(QObject):
                 self._phase = "settle"
         elif self._phase == "settle":
             if self._settled_at is not None and time.monotonic() - self._settled_at > 1.5:
+                self._gds_path = os.path.splitext(self.target)[0] + ".gds"
+                window.export_gds_file(self._gds_path, True)
+                self._phase = "gds"
+        elif self._phase == "gds":
+            if not window._busy:
                 self._gif_path = os.path.splitext(self.target)[0] + ".gif"
                 window.export_gif(self._gif_path, frames=8, fps=20, scale=0.5)
                 self._phase = "gif"
@@ -81,6 +95,11 @@ class SmokeTest(QObject):
                     problems.append("GIF export failed")
                 else:
                     summary += f", GIF {os.path.getsize(self._gif_path) / 1e3:.0f} kB"
+                layers = self._gds_layers()
+                if layers != [(1, 0), (2, 0), (3, 0), (4, 0)]:
+                    problems.append(f"GDS export wrote layers {layers}")
+                else:
+                    summary += f", GDS {os.path.getsize(self._gds_path) / 1e3:.0f} kB on 1/0 2/0 3/0 4/0"
                 if len(project.structure.bodies) != EXPECTED_BODIES or len(project.structure.beams) != EXPECTED_BEAMS:
                     problems.append("unexpected structure")
                 if abs(first - EXPECTED_FIRST_MODE_HZ) > 0.01 * EXPECTED_FIRST_MODE_HZ:

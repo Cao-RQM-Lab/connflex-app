@@ -94,7 +94,7 @@ act-release: ## Run the Linux job of the release workflow locally with act (slow
 	act workflow_dispatch -W .github/workflows/release.yml --matrix os:ubuntu-22.04 --artifact-server-path $(CURDIR)/.act-artifacts $(ACT_FLAGS)
 
 clean: ## Remove build outputs, caches, and test artifacts (keeps the virtual environment)
-	rm -rf build dist *.egg-info .pytest_cache .ruff_cache .act-artifacts smoke-*.png smoke_test.png $(NAME)-*.dmg $(NAME)-*.zip $(NAME)-*.tar.gz
+	rm -rf build dist *.egg-info .pytest_cache .ruff_cache .act-artifacts smoke-*.png smoke-*.gds smoke_test.png $(NAME)-*.dmg $(NAME)-*.zip $(NAME)-*.tar.gz
 	find . -path ./$(VENV) -prune -o -name __pycache__ -type d -print0 | xargs -0 rm -rf
 
 distclean: clean ## Also remove the virtual environment

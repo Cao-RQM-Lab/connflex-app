@@ -225,6 +225,8 @@ class LayoutView(QOpenGLWidget):
                     items.append((render.holes, _rgba(theme.qcolor(theme.BG, 1.0)), None))
             else:
                 items.append((layout.device, _rgba(theme.qcolor(c["device"], 0.92)), _rgba(theme.qcolor("#1d3a66"))))
+        if o.box and project is None and render.box_layer is not None:
+            items.append((render.box_layer, _rgba(theme.qcolor(c["box"], 0.38)), _rgba(theme.qcolor(c["box"], 0.95))))
         if o.box and project is not None:
             for body in project.structure.bodies:
                 if not body.box.is_empty:

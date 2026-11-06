@@ -30,7 +30,9 @@ from connflex_core.progress import stage
 
 from connflex_app import __version__, theme
 from connflex_app.analysis import free_bodies, rigid_mode_count, static_response
-from connflex_app.gds_io import GdsInfo, inspect_gds, load_layout
+from connflex_app.gds_export import LAYERS as GDS_LAYERS, export_gds
+from connflex_app.extraction import extract as extract_structure
+from connflex_app.gds_io import GdsInfo, inspect_gds, load_box, load_layout
 from connflex_app.gif_export import encode_gif, frame_from_qimage
 from connflex_app.geometry import (
     DOF_ORDER,
@@ -52,6 +54,7 @@ from connflex_app.session import Project, Session
 from connflex_app.settings import Settings
 from connflex_app.units import fmt_freq
 from connflex_app.widgets.chips import ChipBar, OverlayHost
+from connflex_app.widgets.gds_dialog import GdsExportDialog
 from connflex_app.widgets.gif_dialog import GifExportDialog
 from connflex_app.widgets.layout_view import LayoutView
 from connflex_app.widgets.modes_panel import ModesPanel
@@ -64,6 +67,7 @@ from connflex_app.workers import ProgressRelay, Worker
 SCENE_KINDS = {"device": KIND_DEVICE, "box": KIND_BOX, "handle": KIND_HANDLE, "beams": KIND_BEAM, "rejected": KIND_REJECTED}
 EXTRACT_STAGES = ("load", "heal", "release", "prune", "nets", "opening", "bodies", "candidates", "beams", "mass", "mesh", "assemble", "prepare")
 MODAL_STAGES = ("assemble", "solve")
+EXPORT_GDS_STAGES = ("openings", "device", "layers", "write")
 
 
 def run_extraction(path: str, settings: Settings, progress, bounds=None) -> Project:
@@ -72,10 +76,11 @@ def run_extraction(path: str, settings: Settings, progress, bounds=None) -> Proj
     started = time.perf_counter()
     with stage("load", progress):
         layout = load_layout(path, settings, bounds)
+        box = load_box(path, settings, bounds)
     timings["load"] = time.perf_counter() - started
     stack, params = settings.stack(), settings.params()
     started = time.perf_counter()
-    structure = cf.extract(layout, stack, params, progress=progress)
+    structure = extract_structure(layout, stack, params, box=box, progress=progress)
     timings["extract"] = time.perf_counter() - started
     started = time.perf_counter()
     bodies, beams = len(structure.bodies), len(structure.beams)
@@ -223,6 +228,11 @@ class MainWindow(QMainWindow):
         self.act_solve.setShortcut(QKeySequence("Ctrl+M"))
         self.act_solve.setEnabled(False)
         self.act_solve.triggered.connect(self.solve)
+        self.act_export_gds = QAction("Export GDS…", self)
+        self.act_export_gds.setToolTip("Export the extracted, released geometry as a GDS file")
+        self.act_export_gds.setShortcut(QKeySequence("Ctrl+Shift+E"))
+        self.act_export_gds.setEnabled(False)
+        self.act_export_gds.triggered.connect(self.export_gds_dialog)
         self.act_fit = QAction("Fit 2D", self)
         self.act_fit.triggered.connect(self.layout_view.fit)
         self.act_reset = QAction("Reset 3D", self)
@@ -230,6 +240,7 @@ class MainWindow(QMainWindow):
         toolbar.addAction(self.act_open)
         toolbar.addAction(self.act_extract)
         toolbar.addAction(self.act_solve)
+        toolbar.addAction(self.act_export_gds)
         toolbar.addSeparator()
         toolbar.addAction(self.act_fit)
         toolbar.addAction(self.act_reset)
@@ -273,6 +284,7 @@ class MainWindow(QMainWindow):
         self.act_export_gif = QAction("Export animation as GIF…", self)
         self.act_export_gif.setEnabled(False)
         self.act_export_gif.triggered.connect(self.export_gif_dialog)
+        file_menu.addAction(self.act_export_gds)
         file_menu.addAction(self.act_export_structure)
         file_menu.addAction(self.act_export_modes)
         file_menu.addAction(self.act_export_gif)
@@ -413,21 +425,22 @@ class MainWindow(QMainWindow):
         worker.failed.connect(failed)
         worker.start()
 
-    def _set_busy(self, busy: bool, phase: str = "", stages: tuple[str, ...] = ()) -> None:
+    def _set_busy(self, busy: bool, phase: str = "", stages: tuple[str, ...] = (), reset_timings: bool = False, ok: bool = True) -> None:
         self._busy = busy
         self._phase = phase
         self.setup.set_busy(busy)
         self.act_open.setEnabled(not busy)
         self.act_extract.setEnabled(not busy and self._info is not None)
         self.act_solve.setEnabled(not busy and self.session.project is not None)
+        self.act_export_gds.setEnabled(not busy and self.session.project is not None)
         self.modes.solve_button.setEnabled(not busy and self.session.project is not None)
         if busy:
-            self.progress.start_phase(phase, stages)
+            self.progress.start_phase(phase, stages, reset=reset_timings)
         else:
-            self.progress.finish_phase()
+            self.progress.finish_phase(ok=ok)
 
     def _failed(self, title: str, message: str, trace: str) -> None:
-        self._set_busy(False)
+        self._set_busy(False, ok=False)
         self.status_label.setText(f"{title}: {message}")
         box = QMessageBox(QMessageBox.Icon.Critical, title, message, parent=self)
         box.setDetailedText(trace)
@@ -452,7 +465,7 @@ class MainWindow(QMainWindow):
         if self._busy:
             return
         path = os.path.abspath(path)
-        self._set_busy(True, f"Reading {os.path.basename(path)}", ("inspect",))
+        self._set_busy(True, f"Reading {os.path.basename(path)}", ("inspect",), reset_timings=True)
         self.progress.stage_started("inspect", None)
         self._run(lambda: inspect_gds(path), lambda info: self._inspected(path, info), "Could not read the GDS file")
 
@@ -487,7 +500,7 @@ class MainWindow(QMainWindow):
 
         def load():
             layout = load_layout(path, settings, bounds)
-            return layout, prepare_layout(layout)
+            return layout, prepare_layout(layout, box=load_box(path, settings, bounds))
 
         self._run(load, self._previewed, "Could not read the layers")
 
@@ -525,7 +538,7 @@ class MainWindow(QMainWindow):
             return
         self._remember(self._path, settings)
         self.scene.clear_motion()
-        self._set_busy(True, "Extracting", EXTRACT_STAGES)
+        self._set_busy(True, "Extracting", EXTRACT_STAGES, reset_timings=True)
         path = self._path
         bounds = self._info.bounds_m(settings.cell) if self._info is not None else None
         self._run(lambda: run_extraction(path, settings, self._progress, bounds), self._extracted, "Extraction failed")
@@ -599,6 +612,7 @@ class MainWindow(QMainWindow):
         has_project = project is not None
         self.act_solve.setEnabled(has_project and not self._busy)
         self.act_export_structure.setEnabled(has_project)
+        self.act_export_gds.setEnabled(has_project and not self._busy)
         self.act_export_modes.setEnabled(False)
         self._enable_structure_chips(has_project)
         self._set_caption("No motion selected")
@@ -693,6 +707,35 @@ class MainWindow(QMainWindow):
         self.view3d.setVisible(mode in ("split", "3d"))
 
     # ------------------------------------------------------------------ export
+    def export_gds_dialog(self) -> None:
+        if self.session.project is None or self._busy:
+            return
+        dialog = GdsExportDialog(self, GdsExportDialog.suggest_path(self.session.project.path))
+        if dialog.exec() != int(QDialog.DialogCode.Accepted) or not dialog.path:
+            return
+        self.export_gds_file(dialog.path, dialog.separate_release())
+
+    def export_gds_file(self, path: str, separate_release: bool) -> None:
+        """Write the extracted, released structure to ``path`` (see :mod:`connflex_app.gds_export`)."""
+        project = self.session.project
+        if project is None or self._busy:
+            return
+        source = project.settings.cell or (self._info.top_cells[0] if self._info and self._info.top_cells else "CONNFLEX")
+        cell = "".join(ch if ch.isalnum() or ch in "_$" else "_" for ch in source)[:24] + "_RELEASED"
+        self._set_busy(True, "Exporting GDS", EXPORT_GDS_STAGES)
+
+        def done(result) -> None:
+            self._set_busy(False)
+            parts = [f"{GDS_LAYERS[name][0]}/{GDS_LAYERS[name][1]} {name} {result.polygons[name]:,}" for name in GDS_LAYERS]
+            mode = "separate release holes" if separate_release else "holes in device"
+            self.status_label.setText(f"Exported {os.path.basename(path)} ({mode}): " + ", ".join(parts) + " polygons.")
+
+        self._run(
+            lambda: export_gds(project.layout, project.structure, project.params, path, separate_release, cell, self._progress),
+            done,
+            "Could not export the GDS file",
+        )
+
     def export_structure(self) -> None:
         project = self.session.project
         if project is None:

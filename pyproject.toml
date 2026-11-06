@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68", "setuptools-scm>=8"]
+requires = ["setuptools>=77", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,9 +8,10 @@ dynamic = ["version"]
 description = "Desktop GUI for connflex-core: GDS layouts to rigid-body/beam models, modes, and stiffness"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+license = "MIT"
 dependencies = [
-    "connflex-core[gds]>=0.1.0",
+    # The box-layer override and GDS export use connflex-core internals; widen after checking a new minor release.
+    "connflex-core[gds]>=0.1.0,<0.2",
     "PySide6>=6.6",
     "PyOpenGL>=3.1.6",
     "Pillow>=10",

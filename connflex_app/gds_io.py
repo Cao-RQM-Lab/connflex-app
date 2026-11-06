@@ -6,7 +6,9 @@ from dataclasses import dataclass, field
 
 import shapely
 
-from connflex_core import Layout, load_gds
+from shapely import MultiPolygon
+
+from connflex_core import LayerMap, Layout, load_gds
 
 from connflex_app.settings import Settings
 
@@ -107,10 +109,32 @@ def load_layout(
     return Layout.from_shapely(unit=1.0, **geometries)
 
 
+def load_box(
+    path: str, settings: Settings, bounds: tuple[float, float, float, float] | None = None
+) -> MultiPolygon | None:
+    """The drawn box layer of ``settings`` in metres, inverted within ``bounds`` if asked, or None."""
+    if settings.box is None:
+        return None
+    try:
+        # connflex-core's reader (cut-line repair, area checks, merging, units) with the box layer in both silicon roles.
+        box = load_gds(path, layers=LayerMap(device=settings.box, handle=settings.box), cell=settings.cell).device
+    except ValueError as exc:
+        if "has no polygons" in str(exc):
+            raise ValueError(f"the box layer {settings.box[0]}/{settings.box[1]} has no polygons in this cell") from exc
+        raise
+    if settings.invert_box:
+        frame = shapely.box(*(bounds if bounds is not None else box.bounds))
+        complement = frame.difference(box)
+        if complement.is_empty:
+            raise ValueError("inverting the box layer leaves nothing inside the cell bounds")
+        box = MultiPolygon([part for part in shapely.get_parts(complement) if part.geom_type == "Polygon"])
+    return box
+
+
 def guess_roles(stats: list[LayerStats]) -> dict[str, tuple[int, int] | None]:
     """Guess which layer plays each role: the README convention first, then by area."""
     keys = {s.key for s in stats}
-    guess: dict[str, tuple[int, int] | None] = {"device": None, "handle": None, "release": None, "vias": None}
+    guess: dict[str, tuple[int, int] | None] = {"device": None, "handle": None, "release": None, "vias": None, "box": None}
     if (1, 0) in keys and (2, 0) in keys:
         guess["device"], guess["handle"] = (1, 0), (2, 0)
     else:

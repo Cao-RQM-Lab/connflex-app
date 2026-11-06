@@ -26,7 +26,18 @@ from connflex_app.gds_io import GdsInfo, guess_roles
 from connflex_app.widgets.chips import Collapsible
 from connflex_app.settings import MATERIAL_PRESETS, LayerSettings, MaterialSettings, Settings, preset_name
 
-ROLES = (("device", "Device", False), ("handle", "Handle", False), ("release", "Release", True), ("vias", "Vias", True))
+ROLES = (
+    ("device", "Device", False),
+    ("handle", "Handle", False),
+    ("release", "Release", True),
+    ("vias", "Vias", True),
+    ("box", "Box", True),
+)
+ROLE_TIPS = {
+    "box": "Optional: the buried oxide that survives the release, as drawn.\n"
+    "When set it replaces the release calculation: the release distance is not used.\n"
+    "It is clipped to where device and handle silicon overlap and to outside release openings.",
+}
 STACK = (("device", "Device"), ("box", "BOX"), ("handle", "Handle"))
 
 
@@ -119,7 +130,7 @@ class SetupPanel(QWidget):
             combo.setEnabled(False)
             combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
             combo.setMinimumContentsLength(14)
-            combo.setToolTip(f"GDS layer/datatype that holds the {title.lower()} polygons" + (" (optional)" if optional else ""))
+            combo.setToolTip(ROLE_TIPS.get(role, f"GDS layer/datatype that holds the {title.lower()} polygons" + (" (optional)" if optional else "")))
             invert = QCheckBox("Invert")
             invert.setEnabled(False)
             invert.setToolTip(
@@ -196,6 +207,12 @@ class SetupPanel(QWidget):
         self.beam_width_max.setToolTip("0 means the body minimum width")
         form.addRow("Release hole max area", self.hole_area)
         form.addRow("Release distance", self.release_distance)
+        self.box_note = QLabel("Box layer set: the surviving oxide is taken from it, so the release distance is not used. "
+                               "Release holes and the release layer still remove device mass.")
+        self.box_note.setObjectName("muted")
+        self.box_note.setWordWrap(True)
+        self.box_note.setVisible(False)
+        form.addRow(self.box_note)
         form.addRow("Body min width", self.body_min_width)
         form.addRow("Beam width min", self.beam_width_min)
         form.addRow("Beam width max", self.beam_width_max)
@@ -261,6 +278,7 @@ class SetupPanel(QWidget):
         root.addWidget(self.extract_button)
         root.addStretch(1)
 
+        self.role_combos["box"].currentIndexChanged.connect(self._box_role_changed)
         self.apply(Settings())
 
     # --------------------------------------------------------------- helpers
@@ -283,6 +301,14 @@ class SetupPanel(QWidget):
             self._loading = True
             self.preset[key].setCurrentText(name)
             self._loading = False
+
+    def _box_role_changed(self, *_args) -> None:
+        overridden = self.role_combos["box"].currentData() is not None
+        self.release_distance.setEnabled(not overridden)
+        self.release_distance.setToolTip(
+            "Not used: the box layer defines the surviving oxide" if overridden else "Isotropic undercut of the buried oxide during release"
+        )
+        self.box_note.setVisible(overridden)
 
     def _anchor_mode_changed(self, index: int) -> None:
         self.anchor_index.setVisible(index == 1)
@@ -354,6 +380,7 @@ class SetupPanel(QWidget):
             check.setChecked(bool(getattr(remembered, f"invert_{role}", False)) if remembered is not None else False)
             check.setEnabled(True)
             check.blockSignals(False)
+        self._box_role_changed()
 
     # ---------------------------------------------------------------- settings
     def settings(self) -> Settings:
