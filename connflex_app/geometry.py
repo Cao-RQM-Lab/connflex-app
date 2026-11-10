@@ -7,11 +7,12 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import cached_property
 
 import numpy as np
 import shapely
 from numpy.typing import NDArray
-from shapely import MultiPolygon, Polygon
+from shapely import MultiPolygon, Polygon, STRtree
 from shapely.geometry.base import BaseGeometry
 
 from connflex_core import Layout, Stack, Structure
@@ -61,6 +62,147 @@ def closed_plates(structure: Structure) -> dict[int, BaseGeometry]:
 def visible_rejected(structure: Structure) -> list[RejectedCandidate]:
     """Rejected candidates that are not stubs (stubs already belong to a body)."""
     return [candidate for candidate in structure.rejected if len(candidate.bodies) != 1]
+
+
+@dataclass(frozen=True, eq=False)
+class Groups:
+    """Paint groups of a structure: what can take a colour of its own and be picked.
+
+    Group ``e`` below ``electrodes`` is electrode ``e`` of ``Structure.electrodes``. Beams and
+    bridges conduct but belong to no electrode, so each net has one more group for them,
+    ``electrodes + net``. Buried oxide has no group (-1).
+
+    Attributes:
+        electrodes: Number of electrodes.
+        nets: Number of nets.
+        net: Net of each group.
+        body: Body each group moves with; -1 for the groups of beams and bridges.
+        layer: ``"device"`` or ``"handle"`` for each group.
+    """
+
+    electrodes: int
+    nets: int
+    net: NDArray[np.intp]
+    body: NDArray[np.intp]
+    layer: tuple[str, ...]
+
+    @property
+    def count(self) -> int:
+        return self.electrodes + self.nets
+
+    def of_net(self, net: int) -> int:
+        """Group of the beams and bridges of ``net``."""
+        return self.electrodes + int(net)
+
+    def in_net(self, net: int) -> NDArray[np.intp]:
+        """Every group of ``net``: its electrodes and its beams."""
+        return np.flatnonzero(self.net == net)
+
+    @cached_property
+    def handle(self) -> NDArray[np.bool_]:
+        """Which groups are handle silicon."""
+        return np.array([layer == "handle" for layer in self.layer], dtype=bool)
+
+    @classmethod
+    def of(cls, structure: Structure) -> Groups:
+        electrodes = structure.electrodes
+        nets = structure.nets.count
+        net = np.array([e.net for e in electrodes] + list(range(nets)), dtype=np.intp)
+        body = np.array([e.body for e in electrodes] + [-1] * nets, dtype=np.intp)
+        layer = tuple([e.layer for e in electrodes] + ["device"] * nets)
+        return cls(len(electrodes), nets, net, body, layer)
+
+
+@dataclass(frozen=True)
+class Piece:
+    """One connected piece of solid silicon: what both views draw for bodies and electrodes.
+
+    Attributes:
+        geometry: The piece, release holes closed, in metres.
+        layer: ``"device"`` or ``"handle"``.
+        body: Body it moves with.
+        group: Its electrode (see :class:`Groups`), or -1.
+    """
+
+    geometry: Polygon
+    layer: str
+    body: int
+    group: int
+
+
+def _parts(geometry: BaseGeometry) -> list[Polygon]:
+    return [part for part in shapely.get_parts(geometry) if isinstance(part, Polygon) and not part.is_empty]
+
+
+def silicon_pieces(structure: Structure, plates: dict[int, BaseGeometry] | None = None) -> list[Piece]:
+    """Device plates and handle polygons of every body, each with the electrode it is.
+
+    A device piece is one connected part of a body's closed plate (see :func:`closed_plates`):
+    a body polygon merged with its stubs, such as a shuttle with its comb fingers. It takes the
+    electrode whose body polygon it holds; where a bridge joins two body polygons of one body
+    into one piece, that is the larger of the two, which shares its net with the other.
+    Pieces are ordered by body, device before handle.
+    """
+    if plates is None:
+        plates = closed_plates(structure)
+    seeds: dict[int, list[tuple[int, Polygon]]] = {}
+    below: dict[int, list[tuple[int, Polygon]]] = {}
+    for electrode in structure.electrodes:
+        which = seeds if electrode.layer == "device" else below
+        which.setdefault(electrode.body, []).append((electrode.index, electrode.region.geoms[0]))
+    pieces: list[Piece] = []
+    for body in structure.bodies:
+        parts = _parts(plates[body.index])
+        owner = [-1] * len(parts)
+        area = [0.0] * len(parts)
+        if parts and body.index in seeds:
+            tree = STRtree(parts)
+            for index, polygon in seeds[body.index]:
+                for hit in tree.query(polygon.representative_point(), predicate="intersects"):
+                    if polygon.area > area[hit]:
+                        owner[hit], area[hit] = index, polygon.area
+        pieces += [Piece(part, "device", body.index, owner[k]) for k, part in enumerate(parts)]
+        under = below.get(body.index, [])
+        tree = STRtree([polygon for _index, polygon in under]) if under else None
+        for part in _parts(body.handle):
+            group = -1
+            if tree is not None:
+                hits = tree.query(part.representative_point(), predicate="intersects")
+                if hits.size:
+                    group = under[int(hits[0])][0]
+            pieces.append(Piece(part, "handle", body.index, group))
+    return pieces
+
+
+def device_group_lookup(structure: Structure, groups: Groups | None = None) -> Callable[[BaseGeometry], int]:
+    """Function giving the paint group of any device-layer polygon: its electrode when it
+    lies in one, otherwise the group of its net's beams and bridges, otherwise -1."""
+    if groups is None:
+        groups = Groups.of(structure)
+    regions: list[Polygon] = []
+    owners: list[int] = []
+    for electrode in structure.electrodes:
+        if electrode.layer == "device":
+            for part in electrode.region.geoms:
+                regions.append(part)
+                owners.append(electrode.index)
+    conductors = [c for c in structure.nets.conductors if c.layer == "device"]
+    region_tree = STRtree(regions) if regions else None
+    conductor_tree = STRtree([c.polygon for c in conductors]) if conductors else None
+
+    def lookup(polygon: BaseGeometry) -> int:
+        point = polygon.representative_point()
+        if region_tree is not None:
+            hits = region_tree.query(point, predicate="intersects")
+            if hits.size:
+                return owners[int(hits.min())]
+        if conductor_tree is not None:
+            hits = conductor_tree.query(point, predicate="intersects")
+            if hits.size:
+                return groups.of_net(conductors[int(hits.min())].net)
+        return -1
+
+    return lookup
 
 
 TriangleCache = dict[int, tuple[BaseGeometry, NDArray[np.float64]]]
@@ -171,7 +313,8 @@ def extrude(
     return np.concatenate(vertices), np.concatenate(indices)
 
 
-COL_A, COL_B, COL_S, COL_KIND = 6, 7, 8, 9
+COL_A, COL_B, COL_S, COL_KIND, COL_GROUP = 6, 7, 8, 9, 10
+VERTEX_FLOATS = 11
 
 
 @dataclass
@@ -179,9 +322,10 @@ class Mesh:
     """Indexed triangle mesh of the whole structure in scene units, grouped by kind.
 
     ``vertices`` holds, per vertex: position (3), normal (3), the two bodies whose rigid
-    motion the vertex follows and the weight of the second one (3), and the kind (1).
-    Rigid vertices have ``a == b``, beam vertices blend from one end body to the other, and
-    static vertices have ``a == b == -1``. ``ranges`` gives the index range of each kind.
+    motion the vertex follows and the weight of the second one (3), the kind (1), and the
+    paint group (1, see :class:`Groups`). Rigid vertices have ``a == b``, beam vertices blend
+    from one end body to the other, and static vertices have ``a == b == -1``. ``ranges``
+    gives the index range of each kind.
     """
 
     vertices: NDArray[np.float32]
@@ -222,6 +366,10 @@ class Mesh:
         return np.where(self.kind == KIND_BEAM, -1, self.blend_a)
 
     @property
+    def group(self) -> NDArray[np.int32]:
+        return self.vertices[:, COL_GROUP].astype(np.int32)
+
+    @property
     def triangles(self) -> int:
         return len(self.indices) // 3
 
@@ -247,11 +395,11 @@ class _MeshBuilder:
     def __init__(self) -> None:
         self.parts: dict[int, list[tuple]] = {kind: [] for kind in range(5)}
 
-    def add(self, kind, vertices, indices, blend_a, blend_b, blend_s) -> None:
+    def add(self, kind, vertices, indices, blend_a, blend_b, blend_s, group: int = -1) -> None:
         if len(vertices) == 0:
             return
         s = np.full(len(vertices), blend_s, dtype=np.float64) if np.isscalar(blend_s) else np.asarray(blend_s, np.float64)
-        self.parts[kind].append((vertices, indices, blend_a, blend_b, s))
+        self.parts[kind].append((vertices, indices, blend_a, blend_b, s, group))
 
     def build(self, centers: NDArray[np.float64]) -> Mesh:
         chunks: list[NDArray[np.float64]] = []
@@ -261,9 +409,15 @@ class _MeshBuilder:
         index_offset = 0
         for kind in range(5):
             kind_indices = 0
-            for vertices, indices, a, b, s in self.parts[kind]:
+            for vertices, indices, a, b, s, group in self.parts[kind]:
                 n = len(vertices)
-                extra = np.column_stack([np.full(n, a, dtype=np.float64), np.full(n, b, dtype=np.float64), s, np.full(n, kind, dtype=np.float64)])
+                extra = np.column_stack([
+                    np.full(n, a, dtype=np.float64),
+                    np.full(n, b, dtype=np.float64),
+                    s,
+                    np.full(n, kind, dtype=np.float64),
+                    np.full(n, group, dtype=np.float64),
+                ])
                 chunks.append(np.column_stack([vertices[:, :3] * SCENE_UNIT, vertices[:, 3:6], extra]))
                 index_chunks.append(indices + vertex_offset)
                 vertex_offset += n
@@ -271,7 +425,7 @@ class _MeshBuilder:
             ranges[kind] = (index_offset, kind_indices)
             index_offset += kind_indices
         if vertex_offset == 0:
-            return Mesh(np.zeros((0, 10), np.float32), np.zeros(0, np.uint32), ranges, np.zeros(len(centers)))
+            return Mesh(np.zeros((0, VERTEX_FLOATS), np.float32), np.zeros(0, np.uint32), ranges, np.zeros(len(centers)))
         data = np.concatenate(chunks).astype(np.float32)
         indices = np.concatenate(index_chunks).astype(np.uint32)
         radius = np.zeros(len(centers))
@@ -287,23 +441,34 @@ class _MeshBuilder:
 def build_mesh(
     structure: Structure,
     stack: Stack,
-    plates: dict[int, BaseGeometry],
+    pieces: list[Piece] | None = None,
     advance: Callable[[], None] | None = None,
     *,
     cache: TriangleCache | None = None,
 ) -> Mesh:
     """Extrude every body layer, beam, and rejected candidate through the stack.
 
-    ``plates`` are the closed device plates from :func:`closed_plates`; release holes are not
-    modelled, which keeps the mesh small whatever the layout.
+    ``pieces`` are the solid silicon pieces from :func:`silicon_pieces`; release holes are not
+    modelled, which keeps the mesh small whatever the layout. Every vertex carries the paint
+    group of its electrode or net, so the views can colour and pick by net without a new mesh.
     """
+    if pieces is None:
+        pieces = silicon_pieces(structure)
     builder = _MeshBuilder()
+    groups = Groups.of(structure)
+    lookup = device_group_lookup(structure, groups)
     device_z, box_z, handle_z = stack.z_extents
+    by_body: dict[int, list[Piece]] = {}
+    for piece in pieces:
+        by_body.setdefault(piece.body, []).append(piece)
     for body in structure.bodies:
         i = body.index
-        builder.add(KIND_DEVICE, *extrude(plates[i], *device_z, cache), i, i, 0.0)
+        for piece in by_body.get(i, ()):
+            if piece.layer == "device":
+                builder.add(KIND_DEVICE, *extrude(piece.geometry, *device_z, cache), i, i, 0.0, piece.group)
+            else:
+                builder.add(KIND_HANDLE, *extrude(piece.geometry, *handle_z, cache), i, i, 0.0, piece.group)
         builder.add(KIND_BOX, *extrude(body.box, *box_z, cache), i, i, 0.0)
-        builder.add(KIND_HANDLE, *extrude(body.handle, *handle_z, cache), i, i, 0.0)
         if advance is not None:
             advance()
     for beam in structure.beams:
@@ -318,9 +483,9 @@ def build_mesh(
         t = np.clip(t, 0.0, 1.0)
         smooth = t * t * (3.0 - 2.0 * t)
         a, b = beam.bodies
-        builder.add(KIND_BEAM, vertices, indices, a, b, smooth)
+        builder.add(KIND_BEAM, vertices, indices, a, b, smooth, groups.of_net(beam.net))
     for candidate in visible_rejected(structure):
-        builder.add(KIND_REJECTED, *extrude(candidate.polygon, *device_z, cache), -1, -1, 0.0)
+        builder.add(KIND_REJECTED, *extrude(candidate.polygon, *device_z, cache), -1, -1, 0.0, lookup(candidate.polygon))
     return builder.build(body_centers(structure))
 
 
@@ -341,6 +506,40 @@ def motion_from_vector(
             u[body] = vector[row : row + 3]
             theta[body] = vector[row + 3 : row + 6]
     return u, theta
+
+
+def motion_from_history(
+    structure: Structure, dofs: tuple[tuple[int, str], ...], history: NDArray
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Per-body translations and rotations at every time of a displacement history.
+
+    ``history`` holds one row per time and one column per degree of freedom in ``dofs``; the
+    results have shape (times, bodies, 3), with the anchor and bodies without degrees of
+    freedom at zero.
+    """
+    history = np.asarray(history, dtype=np.float64)
+    count = len(structure.bodies)
+    u = np.zeros((len(history), count, 3))
+    theta = np.zeros((len(history), count, 3))
+    for row, (body, name) in enumerate(dofs):
+        if name == "ux":
+            u[:, body] = history[:, row : row + 3]
+            theta[:, body] = history[:, row + 3 : row + 6]
+    return u, theta
+
+
+def trajectory_peak(mesh: Mesh, u: NDArray, theta: NDArray) -> float:
+    """Upper bound of the largest vertex displacement (scene units) over a whole trajectory."""
+    u = np.asarray(u, dtype=np.float64)
+    theta = np.asarray(theta, dtype=np.float64)
+    if u.size == 0:
+        return 1.0
+    bodies = u.shape[1]
+    translation = np.linalg.norm(u, axis=2) * SCENE_UNIT
+    rotation = np.linalg.norm(theta, axis=2) * mesh.body_radius[None, :bodies]
+    peak = float(np.max(translation + rotation))
+    # Below a femtometre there is no motion to magnify, only rounding of the integration.
+    return peak if np.isfinite(peak) and peak > 1e-15 * SCENE_UNIT else 1.0
 
 
 def displacement_field(

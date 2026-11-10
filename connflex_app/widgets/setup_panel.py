@@ -24,7 +24,8 @@ from PySide6.QtWidgets import (
 
 from connflex_app.gds_io import GdsInfo, guess_roles
 from connflex_app.widgets.chips import Collapsible
-from connflex_app.settings import MATERIAL_PRESETS, LayerSettings, MaterialSettings, Settings, preset_name
+from connflex_app.widgets.fields import QuantityEdit
+from connflex_app.settings import MATERIAL_PRESETS, OXIDE_PERMITTIVITY, LayerSettings, MaterialSettings, Settings, preset_name
 
 ROLES = (
     ("device", "Device", False),
@@ -150,6 +151,7 @@ class SetupPanel(QWidget):
         stack_box = QGroupBox("Wafer stack")
         stack_layout = QVBoxLayout(stack_box)
         grid = QGridLayout()
+        stack_layout.addLayout(grid)  # into its parent first: PySide mishandles widgets added to a grid layout that has no parent yet
         grid.setHorizontalSpacing(8)
         for column, header in enumerate(("", "Thickness", "Material")):
             label = QLabel(header)
@@ -187,7 +189,20 @@ class SetupPanel(QWidget):
             props.addWidget(self.modulus[key], row, 1)
             props.addWidget(self.poisson[key], row, 2)
             props.addWidget(self.density[key], row, 3)
-        stack_layout.addLayout(grid)
+        self.box_permittivity = _spin(1.0, 10000.0, 2, 0.1)
+        self.box_permittivity.setValue(OXIDE_PERMITTIVITY)
+        self.box_permittivity.setToolTip("Relative permittivity of the buried oxide: sets the capacitance through oxide that survives the release")
+        self.resistivity = QuantityEdit("Ω·m", None, optional=True, positive=True)
+        self.resistivity.set_automatic("ideal conductor")
+        self.resistivity.setToolTip(
+            "Electrical resistivity of the device layer, which gives every beam a resistance (0.01 Ω·cm is 1e-4 Ω·m).\n"
+            "Empty: beams conduct ideally and every net is one node."
+        )
+        for row, (title, widget) in enumerate((("BOX relative permittivity εr", self.box_permittivity), ("Device resistivity", self.resistivity)), start=len(STACK) + 1):
+            label = QLabel(title)
+            label.setObjectName("muted")
+            props.addWidget(label, row, 0, 1, 2)
+            props.addWidget(widget, row, 2, 1, 2)
         stack_layout.addWidget(Collapsible("Material properties", properties))
         root.addWidget(stack_box)
 
@@ -246,11 +261,14 @@ class SetupPanel(QWidget):
         self.buffer_resolution.setRange(1, 64)
         self.precision_grid = _spin(0.0, 1e6, 3, 1.0, "nm")
         self.precision_grid.setSpecialValueText("off")
+        self.via_resistance = QuantityEdit("Ω", 0.0, minimum=0.0)
+        self.via_resistance.setToolTip("Resistance of each via between a device and a handle electrode. Zero is an ideal connection.")
         advanced_form.addRow("Heal distance", self.heal_distance)
         advanced_form.addRow("Simplify tolerance", self.simplify_tolerance)
         advanced_form.addRow("Beam overlap margin", self.overlap_margin)
         advanced_form.addRow("Buffer resolution", self.buffer_resolution)
         advanced_form.addRow("Precision grid", self.precision_grid)
+        advanced_form.addRow("Via resistance", self.via_resistance)
         form.addRow(Collapsible("Advanced", advanced))
         root.addWidget(extraction_box)
 
@@ -290,6 +308,8 @@ class SetupPanel(QWidget):
         self.modulus[key].setValue(preset.youngs_modulus / 1e9)
         self.poisson[key].setValue(preset.poisson_ratio)
         self.density[key].setValue(preset.density)
+        if key == "box" and preset.relative_permittivity is not None:
+            self.box_permittivity.setValue(preset.relative_permittivity)
         self._loading = False
 
     def _material_edited(self, key: str) -> None:
@@ -390,8 +410,15 @@ class SetupPanel(QWidget):
             setattr(s, f"invert_{role}", self.invert_checks[role].isChecked())
         s.cell = self.cell_combo.currentText() if self.cell_combo.count() > 1 else None
         for key in ("device", "box", "handle"):
-            material = MaterialSettings(self.density[key].value(), self.modulus[key].value() * 1e9, self.poisson[key].value())
+            material = MaterialSettings(
+                self.density[key].value(),
+                self.modulus[key].value() * 1e9,
+                self.poisson[key].value(),
+                resistivity=self.resistivity.value() if key == "device" else None,
+                relative_permittivity=self.box_permittivity.value() if key == "box" else None,
+            )
             setattr(s, f"stack_{key}", LayerSettings(self.thickness[key].value() * 1e-6, material))
+        s.via_resistance = float(self.via_resistance.value() or 0.0)
         s.release_hole_max_area = self.hole_area.value() * 1e-12
         s.release_distance = self.release_distance.value() * 1e-6
         s.body_min_width = self.body_min_width.value() * 1e-6
@@ -428,6 +455,9 @@ class SetupPanel(QWidget):
             self.poisson[key].setValue(layer.material.poisson_ratio)
             self.density[key].setValue(layer.material.density)
             self.preset[key].setCurrentText(preset_name(layer.material))
+        self.box_permittivity.setValue(s.stack_box.material.relative_permittivity or OXIDE_PERMITTIVITY)
+        self.resistivity.set_value(s.stack_device.material.resistivity)
+        self.via_resistance.set_value(s.via_resistance)
         self.hole_area.setValue(s.release_hole_max_area * 1e12)
         self.release_distance.setValue(s.release_distance * 1e6)
         self.body_min_width.setValue(s.body_min_width * 1e6)

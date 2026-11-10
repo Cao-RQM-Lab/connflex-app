@@ -1,8 +1,10 @@
 """2D layout view rendered with OpenGL: pre-triangulated layers, live overlays, and picking.
 
 Fills and outlines live in GPU buffers that only change when the data or the display
-options change; panning and zooming only update one matrix. Labels, markers, and the scale
-bar are drawn with QPainter on top.
+options change; panning and zooming only update one matrix. Silicon that belongs to a paint
+group (an electrode, or the beams of a net) can take its colour from a small table instead,
+so colouring by net, selection, or voltage is one texture upload. Labels, markers, and the
+scale bar are drawn with QPainter on top.
 """
 
 from __future__ import annotations
@@ -27,20 +29,30 @@ from connflex_app.units import fmt_length, fmt_mass, fmt_point
 
 LABEL_LIMIT = 400
 MARKER_LIMIT = 3000
+GROUP_TEXTURE_WIDTH = 1024
 
 VERTEX_SHADER = """
 #version 330 core
 layout(location = 0) in vec2 a_position;
 layout(location = 1) in vec4 a_color;
+layout(location = 2) in float a_group;
 uniform mat3 u_view;
 uniform vec2 u_offset;
+uniform sampler2D u_groups;
+uniform float u_use_groups;
 out vec4 v_color;
 void main() {
     vec3 p = u_view * vec3(a_position, 1.0);
     gl_Position = vec4(p.xy + u_offset, 0.0, 1.0);
-    v_color = a_color;
+    vec4 color = a_color;
+    if (u_use_groups > 0.5 && a_group > -0.5) {
+        int g = int(floor(a_group + 0.5));
+        vec4 paint = texelFetch(u_groups, ivec2(g % {width}, g / {width}), 0);
+        color.rgb = mix(color.rgb, paint.rgb, paint.a);
+    }
+    v_color = color;
 }
-"""
+""".replace("{width}", str(GROUP_TEXTURE_WIDTH))
 
 FRAGMENT_SHADER = """
 #version 330 core
@@ -74,18 +86,21 @@ class ViewOptions:
     vias: bool = True
     beams: bool = True
     rejected: bool = True
-    color_mode: str = "layer"  # layer | body | net
+    color_mode: str = "layer"  # layer | group (colours from the table of set_group_colors)
+    paint_links: bool = False  # in group mode, beams and rejected candidates take their net's colour too
+    highlight_links: bool = True  # the beam and rejected highlights win over that colour (the Mechanical tab)
     mech_graph: bool = False
     elec_graph: bool = False
 
 
 class _Batch:
-    """One vertex array with a position and a colour buffer."""
+    """One vertex array with a position, a colour, and a paint-group buffer."""
 
     def __init__(self) -> None:
         self.vao = 0
         self.positions = 0
         self.colors = 0
+        self.groups = 0
         self.count = 0
 
 
@@ -98,6 +113,8 @@ class LayoutView(QOpenGLWidget):
 
     hovered = Signal(object)
     bodyClicked = Signal(int)
+    groupClicked = Signal(int, int)  # paint group (-1 for none) and the keyboard modifiers held
+    groupHovered = Signal(int)
     anchorPicked = Signal(float, float)
 
     BATCHES = ("fills", "lines", "graph", "hover", "select")
@@ -115,12 +132,17 @@ class LayoutView(QOpenGLWidget):
         self._center = np.zeros(2)
         self._fitted = False
         self._bounds: tuple[float, float, float, float] | None = None
-        self._items: list[tuple[object, tuple | None, tuple | None]] = []
-        self._pending: dict[str, tuple[np.ndarray | None, np.ndarray | None]] = {}
+        self._items: list[tuple[object, tuple | None, tuple | None, int]] = []
+        self._pending: dict[str, tuple] = {}
         self._batches: dict[str, _Batch] = {}
         self._gl_ready = False
         self._program = 0
         self._uniforms: dict[str, int] = {}
+        self._group_table: np.ndarray | None = None
+        self._group_texture = 0
+        self._group_dirty = True
+        self._pick_mode = "body"
+        self._hover_group = -1
         self._hover: tuple[str, int] | None = None
         self._selected = -1
         self._drag_last: QPointF | None = None
@@ -153,6 +175,45 @@ class LayoutView(QOpenGLWidget):
             setattr(self.options, key, value)
         self._rebuild_items()
         self._rebuild_graph()
+        self.update()
+
+    def set_group_colors(self, table: np.ndarray | None) -> None:
+        """RGBA per paint group, mixed over the layer colour by alpha; shown in colour mode ``"group"``."""
+        self._group_table = None if table is None else np.ascontiguousarray(table, dtype=np.float32)
+        self._group_dirty = True
+        self.update()
+
+    def set_pick_mode(self, mode: str) -> None:
+        """What a click and the pointer pick: ``"body"`` or ``"group"`` (an electrode or a net's beams)."""
+        if mode == self._pick_mode:
+            return
+        self._pick_mode = mode
+        self._hover_group = -1
+        if self._hover is not None:
+            self._hover = None
+            self._pending["hover"] = (None, None)
+            self.update()
+
+    def group_at(self, pos: QPointF) -> int:
+        """Paint group under a widget position, or -1."""
+        if self._render is None or self._project is None:
+            return -1
+        x, y = self._to_world(pos)
+        return self._render.group_at(x, y)
+
+    def set_outline(self, geometries=None, color: str = theme.HOVER) -> None:
+        """Outline ``geometries`` on top of the layout, or remove the outline with None.
+
+        It uses the outline of the selected body, so it is for the tabs that select no body.
+        """
+        render = self._render
+        edges = [render.edge(geometry) for geometry in geometries] if render is not None and geometries else []
+        edges = [edge for edge in edges if len(edge)]
+        if edges:
+            joined = np.concatenate(edges)
+            self._pending["select"] = (joined, _colored(joined, _rgba(QColor(color))))
+        else:
+            self._pending["select"] = (None, None)
         self.update()
 
     def set_selected(self, body: int) -> None:
@@ -190,71 +251,83 @@ class LayoutView(QOpenGLWidget):
 
     def _rebuild_items(self) -> None:
         """Decide what gets filled and outlined, in paint order, then pack the GPU arrays."""
-        items: list[tuple[object, tuple | None, tuple | None]] = []
+        items: list[tuple[object, tuple | None, tuple | None, int]] = []
         layout, project, render, o = self._layout, self._project, self._render, self.options
         self._items = items
         if layout is None or render is None:
             self._pending["fills"] = (None, None)
             self._pending["lines"] = (None, None)
             return
-        colored = project is not None and o.color_mode in ("body", "net")
+        grouped = project is not None and o.color_mode == "group"
         c = theme.LAYER
+        dark = _rgba(theme.qcolor("#0f1218", 0.7))
         if o.handle:
-            if colored:
-                items.append((layout.handle, _rgba(theme.qcolor(c["handle"], 0.55)), None))
-                if o.color_mode == "body":
-                    for body in project.structure.bodies:
-                        items.append((body.handle, _rgba(theme.body_color(body.index, 0.35)), None))
-                else:
-                    for conductor in project.structure.nets.conductors:
-                        if conductor.layer == "handle":
-                            items.append((conductor.polygon, _rgba(theme.categorical(conductor.net, 0.35)), None))
+            if grouped:
+                items.append((layout.handle, _rgba(theme.qcolor(c["handle"], 0.55)), None, -1))
+                tint = _rgba(theme.qcolor(c["handle"], 0.35))
+                for piece in render.pieces:
+                    if piece.layer == "handle":
+                        items.append((piece.geometry, tint, None, piece.group))
             else:
-                items.append((layout.handle, _rgba(theme.qcolor(c["handle"], 0.9)), _rgba(theme.qcolor("#6c7488"))))
+                items.append((layout.handle, _rgba(theme.qcolor(c["handle"], 0.9)), _rgba(theme.qcolor("#6c7488")), -1))
         if o.device:
-            if colored:
-                items.append((layout.device, _rgba(theme.qcolor(c["device_dim"], 0.55)), None))
-                if o.color_mode == "body":
-                    for body in project.structure.bodies:
-                        items.append((project.plates[body.index], _rgba(theme.body_color(body.index, 0.92)), _rgba(theme.qcolor("#0f1218", 0.7))))
-                else:
-                    for conductor in project.structure.nets.conductors:
-                        if conductor.layer == "device":
-                            items.append((conductor.polygon, _rgba(theme.categorical(conductor.net, 0.92)), _rgba(theme.qcolor("#0f1218", 0.7))))
-                if render.holes is not None:  # the closed plates hide the release holes; draw them back
-                    items.append((render.holes, _rgba(theme.qcolor(theme.BG, 1.0)), None))
+            if grouped:
+                base = _rgba(theme.qcolor(c["device_dim"], 0.92))
+                items.append((layout.device, _rgba(theme.qcolor(c["device_dim"], 0.55)), None, -1))
+                for piece in render.pieces:
+                    if piece.layer == "device":
+                        items.append((piece.geometry, base, dark, piece.group))
+                if render.holes is not None:  # the solid pieces hide the release holes; draw them back
+                    items.append((render.holes, _rgba(theme.qcolor(theme.BG, 1.0)), None, -1))
             else:
-                items.append((layout.device, _rgba(theme.qcolor(c["device"], 0.92)), _rgba(theme.qcolor("#1d3a66"))))
+                items.append((layout.device, _rgba(theme.qcolor(c["device"], 0.92)), _rgba(theme.qcolor("#1d3a66")), -1))
+        links = grouped and o.paint_links
+        plain = links and not o.highlight_links  # colour means net or voltage alone: nothing may tint it
         if o.box and project is None and render.box_layer is not None:
-            items.append((render.box_layer, _rgba(theme.qcolor(c["box"], 0.38)), _rgba(theme.qcolor(c["box"], 0.95))))
+            items.append((render.box_layer, _rgba(theme.qcolor(c["box"], 0.38)), _rgba(theme.qcolor(c["box"], 0.95)), -1))
         if o.box and project is not None:
+            # A fill over the pads would change the colour they carry, so where colour means
+            # net or voltage the surviving oxide is drawn as its outline alone.
+            fill = None if plain else _rgba(theme.qcolor(c["box"], 0.38))
             for body in project.structure.bodies:
                 if not body.box.is_empty:
-                    items.append((body.box, _rgba(theme.qcolor(c["box"], 0.38)), _rgba(theme.qcolor(c["box"], 0.95))))
-        if o.beams and project is not None:
-            for beam in project.structure.beams:
-                items.append((beam.polygon, _rgba(theme.qcolor(c["beam"], 0.95)), _rgba(theme.qcolor("#7c2d12"))))
-        if o.rejected and render.rejected:
-            for candidate in render.rejected:
-                items.append((candidate.polygon, _rgba(theme.qcolor(c["rejected"], 0.55)), _rgba(theme.qcolor(c["rejected"]))))
+                    items.append((body.box, fill, _rgba(theme.qcolor(c["box"], 0.6 if plain else 0.95)), -1))
+        net_coloured = _rgba(theme.qcolor(c["device_dim"], 0.92))
+        if project is not None and (o.beams or links):
+            painted = links and not (o.beams and o.highlight_links)
+            fill = net_coloured if painted else _rgba(theme.qcolor(c["beam"], 0.95))
+            outline = dark if painted else _rgba(theme.qcolor("#7c2d12"))
+            for beam, group in zip(project.structure.beams, render.beam_groups):
+                items.append((beam.polygon, fill, outline, group if painted else -1))
+        if render.rejected and (o.rejected or links):
+            painted = links and not (o.rejected and o.highlight_links)
+            for candidate, group in zip(render.rejected, render.rejected_groups):
+                if painted:
+                    items.append((candidate.polygon, net_coloured, dark, group))
+                else:
+                    items.append((candidate.polygon, _rgba(theme.qcolor(c["rejected"], 0.55)), _rgba(theme.qcolor(c["rejected"])), -1))
         if o.release and layout.release is not None:
-            items.append((layout.release, _rgba(theme.qcolor(c["release"], 0.12)), _rgba(theme.qcolor(c["release"]))))
+            items.append((layout.release, _rgba(theme.qcolor(c["release"], 0.12)), _rgba(theme.qcolor(c["release"])), -1))
         if o.vias and layout.vias is not None:
-            items.append((layout.vias, _rgba(theme.qcolor(c["vias"], 0.85)), _rgba(theme.qcolor("#c4b5fd"))))
+            items.append((layout.vias, _rgba(theme.qcolor(c["vias"], 0.85)), _rgba(theme.qcolor("#c4b5fd")), -1))
 
-        fill_pos, fill_col, line_pos, line_col = [], [], [], []
-        for geometry, fill, outline in items:
+        fill_pos, fill_col, fill_group, line_pos, line_col = [], [], [], [], []
+        for geometry, fill, outline, group in items:
             if fill is not None:
                 tri = render.tri(geometry)
                 if len(tri):
                     fill_pos.append(tri)
                     fill_col.append(_colored(tri, fill))
+                    fill_group.append(np.full(len(tri), group, dtype=np.float32))
             if outline is not None:
                 edges = render.edge(geometry)
                 if len(edges):
                     line_pos.append(edges)
                     line_col.append(_colored(edges, outline))
-        self._pending["fills"] = (np.concatenate(fill_pos), np.concatenate(fill_col)) if fill_pos else (None, None)
+        if fill_pos:
+            self._pending["fills"] = (np.concatenate(fill_pos), np.concatenate(fill_col), np.concatenate(fill_group))
+        else:
+            self._pending["fills"] = (None, None)
         self._pending["lines"] = (np.concatenate(line_pos), np.concatenate(line_col)) if line_pos else (None, None)
 
     def _rebuild_graph(self) -> None:
@@ -346,12 +419,14 @@ class LayoutView(QOpenGLWidget):
         GL.glDeleteShader(vertex)
         GL.glDeleteShader(fragment)
         self._program = program
-        self._uniforms = {name: GL.glGetUniformLocation(program, name) for name in ("u_view", "u_offset")}
+        names = ("u_view", "u_offset", "u_groups", "u_use_groups")
+        self._uniforms = {name: GL.glGetUniformLocation(program, name) for name in names}
         for name in self.BATCHES:
             batch = _Batch()
             batch.vao = GL.glGenVertexArrays(1)
             batch.positions = GL.glGenBuffers(1)
             batch.colors = GL.glGenBuffers(1)
+            batch.groups = GL.glGenBuffers(1)
             GL.glBindVertexArray(batch.vao)
             GL.glBindBuffer(GL.GL_ARRAY_BUFFER, batch.positions)
             GL.glEnableVertexAttribArray(0)
@@ -359,8 +434,13 @@ class LayoutView(QOpenGLWidget):
             GL.glBindBuffer(GL.GL_ARRAY_BUFFER, batch.colors)
             GL.glEnableVertexAttribArray(1)
             GL.glVertexAttribPointer(1, 4, GL.GL_FLOAT, GL.GL_FALSE, 16, ctypes.c_void_p(0))
+            GL.glBindBuffer(GL.GL_ARRAY_BUFFER, batch.groups)
+            GL.glEnableVertexAttribArray(2)
+            GL.glVertexAttribPointer(2, 1, GL.GL_FLOAT, GL.GL_FALSE, 4, ctypes.c_void_p(0))
             self._batches[name] = batch
         GL.glBindVertexArray(0)
+        self._group_texture = GL.glGenTextures(1)
+        self._group_dirty = True
         self._gl_ready = True
         if self._render is not None:
             self._rebuild_items()
@@ -368,20 +448,43 @@ class LayoutView(QOpenGLWidget):
             self.set_selected(self._selected)
 
     def _flush_uploads(self) -> None:
-        for name, (positions, colors) in list(self._pending.items()):
+        for name, pending in list(self._pending.items()):
+            positions, colors = pending[0], pending[1]
             batch = self._batches[name]
             if positions is None or len(positions) == 0:
                 batch.count = 0
             else:
                 positions = np.ascontiguousarray(positions, dtype=np.float32)
                 colors = np.ascontiguousarray(colors, dtype=np.float32)
+                groups = pending[2] if len(pending) > 2 else np.full(len(positions), -1.0, dtype=np.float32)
+                groups = np.ascontiguousarray(groups, dtype=np.float32)
                 GL.glBindBuffer(GL.GL_ARRAY_BUFFER, batch.positions)
                 GL.glBufferData(GL.GL_ARRAY_BUFFER, positions.nbytes, positions, GL.GL_STATIC_DRAW)
                 GL.glBindBuffer(GL.GL_ARRAY_BUFFER, batch.colors)
                 GL.glBufferData(GL.GL_ARRAY_BUFFER, colors.nbytes, colors, GL.GL_STATIC_DRAW)
+                GL.glBindBuffer(GL.GL_ARRAY_BUFFER, batch.groups)
+                GL.glBufferData(GL.GL_ARRAY_BUFFER, groups.nbytes, groups, GL.GL_STATIC_DRAW)
                 batch.count = len(positions)
             del self._pending[name]
         GL.glBindBuffer(GL.GL_ARRAY_BUFFER, 0)
+        if self._group_dirty:
+            self._group_dirty = False
+            table = self._group_table
+            count = 0 if table is None else len(table)
+            rows = max(-(-count // GROUP_TEXTURE_WIDTH), 1)
+            data = np.zeros((rows * GROUP_TEXTURE_WIDTH, 4), dtype=np.float32)
+            if count:
+                data[:count] = table
+            GL.glBindTexture(GL.GL_TEXTURE_2D, self._group_texture)
+            for parameter, value in (
+                (GL.GL_TEXTURE_MIN_FILTER, GL.GL_NEAREST),
+                (GL.GL_TEXTURE_MAG_FILTER, GL.GL_NEAREST),
+                (GL.GL_TEXTURE_WRAP_S, GL.GL_CLAMP_TO_EDGE),
+                (GL.GL_TEXTURE_WRAP_T, GL.GL_CLAMP_TO_EDGE),
+            ):
+                GL.glTexParameteri(GL.GL_TEXTURE_2D, parameter, value)
+            GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, GL.GL_RGBA32F, GROUP_TEXTURE_WIDTH, rows, 0, GL.GL_RGBA, GL.GL_FLOAT, data)
+            GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
 
     def _draw_batch(self, name: str, mode, offsets=((0.0, 0.0),)) -> None:
         batch = self._batches[name]
@@ -407,6 +510,10 @@ class LayoutView(QOpenGLWidget):
             GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
             GL.glUseProgram(self._program)
             GL.glUniformMatrix3fv(self._uniforms["u_view"], 1, GL.GL_TRUE, self._view_matrix())
+            GL.glActiveTexture(GL.GL_TEXTURE0)
+            GL.glBindTexture(GL.GL_TEXTURE_2D, self._group_texture)
+            GL.glUniform1i(self._uniforms["u_groups"], 0)
+            GL.glUniform1f(self._uniforms["u_use_groups"], 1.0 if self.options.color_mode == "group" else 0.0)
             self._draw_batch("fills", GL.GL_TRIANGLES)
             self._draw_batch("lines", GL.GL_LINES)
             self._draw_batch("graph", GL.GL_LINES)
@@ -414,6 +521,7 @@ class LayoutView(QOpenGLWidget):
             self._draw_batch("hover", GL.GL_LINES, ((0.0, 0.0), (px, 0.0), (0.0, py)))
             self._draw_batch("select", GL.GL_LINES, ((0.0, 0.0), (px, 0.0), (-px, 0.0), (0.0, py), (0.0, -py)))
             GL.glBindVertexArray(0)
+            GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
             GL.glUseProgram(0)
             GL.glDisable(GL.GL_BLEND)
         painter.endNativePainting()
@@ -525,6 +633,12 @@ class LayoutView(QOpenGLWidget):
             self._drag_last = pos
             self.update()
             return
+        if self._pick_mode == "group":
+            group = self.group_at(pos)
+            if group != self._hover_group:
+                self._hover_group = group
+                self.groupHovered.emit(group)
+            return
         hit = self._hit(pos)
         if hit != self._hover:
             self._set_hover(hit)
@@ -535,6 +649,9 @@ class LayoutView(QOpenGLWidget):
             return
         self._drag_last = None
         if event.button() == Qt.MouseButton.LeftButton and not self._drag_moved:
+            if self._pick_mode == "group":
+                self.groupClicked.emit(self.group_at(event.position()), int(event.modifiers().value))
+                return
             hit = self._hit(event.position())
             body = hit[1] if hit is not None and hit[0] in ("body", "stub") else -1
             self.bodyClicked.emit(body)
@@ -545,6 +662,9 @@ class LayoutView(QOpenGLWidget):
     def leaveEvent(self, event) -> None:  # noqa: N802 - Qt API
         if self._hover is not None:
             self._set_hover(None)
+        if self._hover_group != -1:
+            self._hover_group = -1
+            self.groupHovered.emit(-1)
 
     def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt API
         if event.key() == Qt.Key.Key_F:

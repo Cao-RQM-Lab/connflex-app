@@ -149,7 +149,7 @@ jobs:
       - name: Release notes from CHANGELOG.md
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          awk -v version="$VERSION" '/^## / { if (found) exit; found = ($2 == version); next } found' CHANGELOG.md > release-notes.md
+          awk -v version="$VERSION" -f packaging/release_notes.awk CHANGELOG.md > release-notes.md
           if [ ! -s release-notes.md ]; then
             echo "::warning::CHANGELOG.md has no section for $VERSION; the release gets generated notes only"
           fi

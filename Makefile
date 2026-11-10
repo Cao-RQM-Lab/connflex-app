@@ -72,7 +72,7 @@ build: venv ## Build the self-contained executable with PyInstaller into dist/
 
 verify: ## Run the bundle's headless self-test and GUI smoke test (needs a display)
 	$(EXE) --self-test
-	$(EXE) --smoke-test smoke-$(PLATFORM).png
+	$(EXE) --smoke-test dist/smoke-$(PLATFORM).png
 
 package: ## Archive dist/ as the release artifact for this platform (DMG, zip, or tar.gz)
 ifeq ($(OS),Windows_NT)

@@ -1,11 +1,13 @@
 """Headless self-test: run the whole analysis pipeline on the bundled demo without a GUI.
 
 Used by the release workflow to prove that a frozen bundle can import every dependency
-and reproduce known results, including the box-layer override and the GDS export.
+and reproduce known results: extraction, modes, stiffness, the box-layer override, the GDS
+export, capacitance with the field solved in worker processes, and a transient.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import tempfile
 import time
@@ -16,6 +18,8 @@ EXPECTED_BODIES = 3
 EXPECTED_BEAMS = 9
 EXPECTED_NETS = 3
 EXPECTED_FIRST_MODE_HZ = 45_560.0
+EXPECTED_COMB_CAPACITANCE = 98.1e-15  # farads between the right comb's stator and the proof masses
+WORKERS = 2  # enough to prove that worker processes start, also from a frozen bundle
 
 
 def run(verbose: bool = True) -> int:
@@ -27,10 +31,20 @@ def run(verbose: bool = True) -> int:
     from connflex_app import __version__
     from connflex_app.analysis import condensed_stiffness, static_response
     from connflex_app.data import demo_config, demo_gds
+    from connflex_app.drive import DrivePlan, NetDrive, run_transient
+    from connflex_app.electrical import compute_capacitance, grouping, pair_report
     from connflex_app.extraction import extract as extract_with_box
     from connflex_app.gds_export import LAYERS, export_gds
     from connflex_app.gds_io import inspect_gds, load_layout
-    from connflex_app.geometry import build_mesh, closed_plates, describe_modes, displacement_field, motion_from_vector, normalized, release_holes
+    from connflex_app.geometry import (
+        build_mesh,
+        describe_modes,
+        displacement_field,
+        motion_from_vector,
+        normalized,
+        release_holes,
+        silicon_pieces,
+    )
     from connflex_app.render2d import prepare_project
     from connflex_app.settings import Settings
 
@@ -46,9 +60,9 @@ def run(verbose: bool = True) -> int:
     structure = cf.extract(layout, settings.stack(), settings.params())
     say(f"extracted {len(structure.bodies)} bodies, {len(structure.beams)} beams, {structure.nets.count} nets")
     holes = release_holes(layout, settings.params().release_hole_max_area)
-    plates = closed_plates(structure)
-    mesh = build_mesh(structure, settings.stack(), plates)
-    render = prepare_project(layout, structure, plates, holes)
+    pieces = silicon_pieces(structure)
+    mesh = build_mesh(structure, settings.stack(), pieces)
+    render = prepare_project(layout, structure, pieces, holes)
     system = assemble(structure)
     modal = structure.modal(settings.solve_options())
     labels = describe_modes(structure, modal.dofs, modal.modes)
@@ -79,7 +93,39 @@ def run(verbose: bool = True) -> int:
         + f"; re-extracted first mode {again_first / 1e3:.2f} kHz"
     )
 
+    # Capacitance: plates, sidewalls, and fringe, with the field solved in worker processes.
+    capacitance = compute_capacitance(structure, dataclasses.replace(settings.electro, workers=WORKERS))
+    nets = grouping(structure, "net")
+    stator = structure.electrode_at((1050e-6, 600e-6), "device")
+    shuttle = structure.electrode_at((800e-6, 600e-6), "device")
+    comb = pair_report(capacitance.model, nets, nets.index(stator.net), nets.index(shuttle.net))
+    say(
+        f"capacitance: {capacitance.summary()}; comb N{stator.net}-N{shuttle.net} {comb.value * 1e15:.1f} fF "
+        f"({comb.parts['sidewall'] * 1e15:.1f} sidewall + {comb.parts['fringe'] * 1e15:.1f} fringe) in {capacitance.elapsed:.2f} s"
+    )
+
+    # Transient: 40 V on the comb's stator for a few periods; the shuttle is pulled toward it.
+    plan = DrivePlan(durations=(40e-6,), nets=(NetDrive(stator.net, stator.index, "drive", (40.0,)),), rise_time=1e-6, samples=40)
+    run = run_transient(structure, capacitance.model, plan, settings.transient.options(), workers=WORKERS)
+    travel = run.u[:, shuttle.body, 0]
+    supplied = float(np.abs(run.result.energy.supplied).max())
+    imbalance = float(np.abs(run.result.energy.imbalance).max())
+    say(
+        f"transient: {len(run.times)} outputs, {run.result.steps} steps, shuttle travel up to {travel.max() * 1e9:.2f} nm, "
+        f"energy imbalance {imbalance / supplied if supplied else 0.0:.1e} of supplied, in {run.elapsed:.2f} s"
+    )
+
     problems = []
+    if abs(comb.value - EXPECTED_COMB_CAPACITANCE) > 0.03 * EXPECTED_COMB_CAPACITANCE:
+        problems.append(f"comb capacitance {comb.value * 1e15:.1f} fF, expected about {EXPECTED_COMB_CAPACITANCE * 1e15:.1f} fF")
+    if not np.allclose(capacitance.model.matrix.sum(axis=1), 0.0, atol=1e-18):
+        problems.append("rows of the capacitance matrix do not sum to zero")
+    if run.result.contact is not None or not np.isfinite(run.result.displacement).all():
+        problems.append("the transient did not run to its last time")
+    if not travel.max() > 1e-10:
+        problems.append(f"the comb did not pull the shuttle ({travel.max():.3e} m)")
+    if supplied and imbalance > 1e-3 * supplied:
+        problems.append(f"the transient's energy does not balance ({imbalance / supplied:.1e} of supplied)")
     if len(structure.bodies) != EXPECTED_BODIES:
         problems.append(f"expected {EXPECTED_BODIES} bodies")
     if len(structure.beams) != EXPECTED_BEAMS:

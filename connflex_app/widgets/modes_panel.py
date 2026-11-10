@@ -67,6 +67,7 @@ class ModesPanel(QWidget):
         hint.setWordWrap(True)
         layout.addWidget(hint)
         controls = QGridLayout()
+        layout.addLayout(controls)  # into its parent first: PySide mishandles widgets added to a grid layout that has no parent yet
         controls.setHorizontalSpacing(8)
         self.amplitude_slider = QSlider(Qt.Orientation.Horizontal)
         self.amplitude_slider.setRange(0, 100)
@@ -88,7 +89,6 @@ class ModesPanel(QWidget):
         controls.addWidget(QLabel("Speed"), 1, 0)
         controls.addWidget(self.speed_slider, 1, 1)
         controls.addWidget(self.speed_value, 1, 2)
-        layout.addLayout(controls)
         self.amplitude_slider.valueChanged.connect(self._amplitude_moved)
         self.speed_slider.valueChanged.connect(self._speed_moved)
         self._amplitude_moved(self.amplitude_slider.value())

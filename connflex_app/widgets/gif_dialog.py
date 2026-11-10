@@ -19,26 +19,34 @@ from PySide6.QtWidgets import (
 
 
 class GifExportDialog(QDialog):
-    """Asks for frames per cycle, frame rate, and output scale, then for the file to write."""
+    """Asks for the number of frames, frame rate, and output scale, then for the file to write.
 
-    def __init__(self, parent: QWidget | None, suggested_path: str, frame_size: tuple[int, int]) -> None:
+    ``transient`` words the dialog for a transient, captured once from its first time to its
+    last, instead of one cycle of a mode.
+    """
+
+    def __init__(self, parent: QWidget | None, suggested_path: str, frame_size: tuple[int, int], transient: bool = False) -> None:
         super().__init__(parent)
         self.setWindowTitle("Export animation as GIF")
         self.setModal(True)
         self._suggested = suggested_path
         self._frame_size = frame_size
+        self._transient = transient
         self.path: str | None = None
 
         layout = QVBoxLayout(self)
-        intro = QLabel("One full cycle of the current animation is captured from the 3D view as it is shown now.")
+        if transient:
+            intro = QLabel("The transient is captured from its first time to its last, from the 3D view as it is shown now.")
+        else:
+            intro = QLabel("One full cycle of the current animation is captured from the 3D view as it is shown now.")
         intro.setWordWrap(True)
         intro.setObjectName("muted")
         layout.addWidget(intro)
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
         self.frames = QSpinBox()
-        self.frames.setRange(8, 240)
-        self.frames.setValue(36)
+        self.frames.setRange(8, 480 if transient else 240)
+        self.frames.setValue(120 if transient else 36)
         self.fps = QSpinBox()
         self.fps.setRange(5, 50)
         self.fps.setValue(24)
@@ -47,7 +55,7 @@ class GifExportDialog(QDialog):
         for label, value in (("100 %", 1.0), ("75 %", 0.75), ("50 %", 0.5), ("25 %", 0.25)):
             self.scale.addItem(label, value)
         self.scale.setCurrentIndex(1 if frame_size[0] > 1600 else 0)
-        form.addRow("Frames per cycle", self.frames)
+        form.addRow("Frames" if transient else "Frames per cycle", self.frames)
         form.addRow("Frame rate", self.fps)
         form.addRow("Output size", self.scale)
         layout.addLayout(form)
@@ -73,7 +81,8 @@ class GifExportDialog(QDialog):
     def _refresh(self) -> None:
         frames, fps, scale = self.values()
         width, height = int(self._frame_size[0] * scale), int(self._frame_size[1] * scale)
-        self.summary.setText(f"{frames} frames at {fps} fps: one cycle every {frames / fps:.1f} s · {width} × {height} px per frame.")
+        what = "the run plays in" if self._transient else "one cycle every"
+        self.summary.setText(f"{frames} frames at {fps} fps: {what} {frames / fps:.1f} s · {width} × {height} px per frame.")
 
     def _choose_file(self) -> None:
         path, _ = QFileDialog.getSaveFileName(self, "Save animation", self._suggested, "GIF image (*.gif)")

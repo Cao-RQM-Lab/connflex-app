@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QPoint, QRect, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
+from PySide6.QtCore import QPoint, QRect, QRectF, QSize, Qt, Signal
+from PySide6.QtGui import QColor, QFont, QIcon, QLinearGradient, QPainter, QPixmap
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QLayout, QToolButton, QVBoxLayout, QWidget
 
 
@@ -199,6 +199,56 @@ class ChipBar(QFrame):
         self._buttons[key].setEnabled(on)
 
 
+class VoltageLegend(QWidget):
+    """A colour bar from minus to plus the largest voltage on show, for the views' voltage colouring."""
+
+    def __init__(self, negative, neutral, positive, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._stops = [QColor.fromRgbF(*negative), QColor.fromRgbF(*neutral), QColor.fromRgbF(*positive)]
+        self._low = "−1 V"
+        self._high = "+1 V"
+        self._font = QFont()
+        self._font.setPointSize(10)
+        self.setFixedHeight(22)
+        self._resize()
+
+    def set_scale(self, text: str) -> None:
+        """Label both ends with ``text``, e.g. ``"40 V"``."""
+        low, high = f"−{text}", f"+{text}"
+        if (low, high) != (self._low, self._high):
+            self._low, self._high = low, high
+            self._resize()
+            self.update()
+
+    def _resize(self) -> None:
+        from PySide6.QtGui import QFontMetrics
+
+        metrics = QFontMetrics(self._font)
+        self._left = metrics.horizontalAdvance(self._low) + 6
+        self._right = metrics.horizontalAdvance(self._high) + 6
+        self.setFixedWidth(self._left + 90 + self._right)
+        self.updateGeometry()
+
+    def sizeHint(self) -> QSize:  # noqa: N802 - Qt API
+        return QSize(self.width(), 22)
+
+    def paintEvent(self, event) -> None:  # noqa: N802 - Qt API
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setFont(self._font)
+        bar = QRectF(self._left, 6, 90, 10)
+        gradient = QLinearGradient(bar.left(), 0, bar.right(), 0)
+        for position, color in zip((0.0, 0.5, 1.0), self._stops):
+            gradient.setColorAt(position, color)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(gradient)
+        painter.drawRoundedRect(bar, 3, 3)
+        painter.setPen(QColor("#c9cedb"))
+        painter.drawText(QRectF(0, 0, self._left - 4, 22), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, self._low)
+        painter.drawText(QRectF(bar.right() + 4, 0, self._right, 22), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, self._high)
+        painter.end()
+
+
 class OverlayHost(QWidget):
     """Fills itself with one view and floats other widgets over it, anchored to its edges."""
 
@@ -228,10 +278,16 @@ class OverlayHost(QWidget):
         super().showEvent(event)
         self._place()
 
+    def relayout(self) -> None:
+        """Place the overlays again after one was shown, hidden, or resized."""
+        self._place()
+
     def _place(self) -> None:
         width, height = self.width(), self.height()
         stacks: dict[str, int] = {}
         for widget, anchor, margin in self._overlays:
+            if widget.isHidden():
+                continue
             hint = widget.sizeHint()
             w = min(hint.width(), max(width - 2 * margin, 80))
             layout = widget.layout()

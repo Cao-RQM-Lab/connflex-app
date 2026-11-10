@@ -1,8 +1,10 @@
 """3D view of the extruded structure with live mode animation, orbit camera, and picking.
 
 The mesh is uploaded once as indexed geometry. Rigid-body motion of every mode is applied in
-the vertex shader from a small per-body transform texture, so selecting a mode or a
-deflection shape never touches the vertex buffers. Colours are also resolved in the shader.
+the vertex shader from a small per-body transform texture, so selecting a mode, a deflection
+shape, or a frame of a transient never touches the vertex buffers. Colours are also resolved
+in the shader: by layer, by body, or from a table over paint groups (electrodes and nets),
+which is how nets, selections, and voltages are shown and picked.
 """
 
 from __future__ import annotations
@@ -18,7 +20,20 @@ from PySide6.QtOpenGL import QOpenGLFramebufferObject
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 
 from connflex_app import theme
-from connflex_app.geometry import KIND_BEAM, KIND_BOX, KIND_DEVICE, KIND_HANDLE, KIND_REJECTED, SCENE_UNIT, Mesh, motion_peak
+from connflex_app.geometry import (
+    KIND_BEAM,
+    KIND_BOX,
+    KIND_DEVICE,
+    KIND_HANDLE,
+    KIND_REJECTED,
+    SCENE_UNIT,
+    VERTEX_FLOATS,
+    Mesh,
+    motion_peak,
+    trajectory_peak,
+)
+
+GROUP_TEXTURE_WIDTH = 1024  # group colours wrap into rows so any number of groups fits a texture
 
 VERTEX_SHADER = """
 #version 330 core
@@ -27,17 +42,20 @@ layout(location = 1) in vec3 a_normal;
 layout(location = 2) in vec2 a_bodies;
 layout(location = 3) in float a_blend;
 layout(location = 4) in float a_kind;
+layout(location = 5) in float a_group;
 uniform mat4 u_proj;
 uniform mat4 u_view;
 uniform float u_scale;
 uniform sampler2D u_motion;
 uniform sampler2D u_body_colors;
+uniform sampler2D u_group_colors;
 uniform vec3 u_kind_colors[5];
 uniform float u_color_mode;
 out vec3 v_normal;
 out vec3 v_position;
 out vec3 v_color;
 flat out float v_body;
+flat out float v_group;
 
 vec3 rigid(int body, vec3 p) {
     if (body < 0) return vec3(0.0);
@@ -57,12 +75,22 @@ void main() {
     v_position = pv.xyz;
     v_normal = mat3(u_view) * a_normal;
     vec3 color = u_kind_colors[kind];
-    if (u_color_mode > 0.5 && kind <= 2 && a >= 0) {
+    if (u_color_mode > 1.5) {
+        if (kind == 2) color *= 0.8;
+        if (a_group > -0.5) {
+            int g = int(floor(a_group + 0.5));
+            vec4 paint = texelFetch(u_group_colors, ivec2(g % {width}, g / {width}), 0);
+            color = mix(color, paint.rgb, paint.a);
+        } else if (kind != 1) {
+            color *= 0.7;
+        }
+    } else if (u_color_mode > 0.5 && kind <= 2 && a >= 0) {
         float shade = (kind == 2) ? 0.55 : ((kind == 1) ? 0.8 : 1.0);
         color = texelFetch(u_body_colors, ivec2(0, a), 0).rgb * shade;
     }
     v_color = color;
     v_body = (kind == 3) ? -1.0 : float(a);
+    v_group = a_group;
     gl_Position = u_proj * pv;
 }
 """
@@ -73,6 +101,7 @@ in vec3 v_normal;
 in vec3 v_position;
 in vec3 v_color;
 flat in float v_body;
+flat in float v_group;
 uniform float u_selected;
 uniform float u_hover;
 uniform float u_pick;
@@ -80,8 +109,8 @@ uniform vec3 u_select_color;
 out vec4 frag;
 void main() {
     if (u_pick > 0.5) {
-        int id = int(v_body + 1.5);
-        frag = vec4(float(id & 255) / 255.0, float((id >> 8) & 255) / 255.0, 0.0, 1.0);
+        int id = int((u_pick > 1.5 ? v_group : v_body) + 1.5);
+        frag = vec4(float(id & 255) / 255.0, float((id >> 8) & 255) / 255.0, float((id >> 16) & 255) / 255.0, 1.0);
         return;
     }
     vec3 n = normalize(v_normal);
@@ -102,8 +131,11 @@ void main() {
 }
 """
 
+VERTEX_SHADER = VERTEX_SHADER.replace("{width}", str(GROUP_TEXTURE_WIDTH))
+
 DRAW_ORDER = (KIND_HANDLE, KIND_BOX, KIND_DEVICE, KIND_BEAM, KIND_REJECTED)
-STRIDE = 40  # ten float32 per vertex
+STRIDE = 4 * VERTEX_FLOATS  # float32 per vertex: position, normal, bodies, blend, kind, group
+LOOP_SECONDS = 8.0  # wall-clock time one pass through a transient takes at speed 1
 
 
 def perspective(fov_y_deg: float, aspect: float, near: float, far: float) -> np.ndarray:
@@ -157,7 +189,10 @@ class Scene3D(QOpenGLWidget):
 
     bodyClicked = Signal(int)
     hovered = Signal(int)
+    groupClicked = Signal(int, int)  # paint group (-1 for none) and the keyboard modifiers held
+    groupHovered = Signal(int)
     playingChanged = Signal(bool)
+    timeChanged = Signal(float)  # simulation time shown, while a trajectory is loaded
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -168,16 +203,24 @@ class Scene3D(QOpenGLWidget):
         self._centers = np.zeros((0, 3), dtype=np.float32)
         self._motion = np.zeros((0, 3, 4), dtype=np.float32)
         self._peak = 1.0
-        self._dirty = {"mesh": False, "motion": False, "colors": False}
+        self._dirty = {"mesh": False, "motion": False, "colors": False, "groups": False}
         self._gl_ready = False
         self._program = 0
         self._vao = 0
         self._vbo = 0
         self._ebo = 0
-        self._textures = {"motion": 0, "colors": 0}
+        self._textures = {"motion": 0, "colors": 0, "groups": 0}
         self._uniforms: dict[str, int] = {}
         self._visible = {kind: True for kind in range(5)}
         self._color_mode = "layer"
+        self._group_table: np.ndarray | None = None
+        self._pick_mode = "body"
+        self._hover_group = -1
+        self._click_modifiers = 0
+        self._trajectory: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
+        self._time = 0.0
+        self._rate = 1.0
+        self._true_scale = False
         self._selected = -1
         self._hover = -1
         self._target = np.zeros(3, dtype=np.float64)
@@ -218,19 +261,38 @@ class Scene3D(QOpenGLWidget):
         self._peak = 1.0
         self._animated = False
         self._caption = ""
+        self._trajectory = None
+        self._group_table = None
         self._selected = -1
         self._hover = -1
+        self._hover_group = -1
         self._pick_state = None
         self.play(False)
         if mesh is not None and mesh.count:
             self._extent = mesh.extent
             self.reset_view()
-        self._dirty = {"mesh": True, "motion": True, "colors": True}
+        self._dirty = {"mesh": True, "motion": True, "colors": True, "groups": True}
         self.update()
 
     def set_color_mode(self, mode: str) -> None:
+        """``"layer"``, ``"body"``, or ``"group"`` (colours from :meth:`set_group_colors`)."""
         if mode != self._color_mode:
             self._color_mode = mode
+            self.update()
+
+    def set_group_colors(self, table: np.ndarray | None) -> None:
+        """RGBA per paint group, mixed over the layer colour by alpha; shown in colour mode ``"group"``."""
+        self._group_table = None if table is None else np.ascontiguousarray(table, dtype=np.float32)
+        self._dirty["groups"] = True
+        self.update()
+
+    def set_pick_mode(self, mode: str) -> None:
+        """What a click and the pointer pick: ``"body"`` or ``"group"`` (an electrode or a net's beams)."""
+        if mode != self._pick_mode:
+            self._pick_mode = mode
+            self._pick_state = None
+            self._hover = -1
+            self._hover_group = -1
             self.update()
 
     def set_visible(self, kind: int, on: bool) -> None:
@@ -244,6 +306,7 @@ class Scene3D(QOpenGLWidget):
 
     def set_motion(self, u: np.ndarray | None, theta: np.ndarray | None, animated: bool, caption: str = "") -> None:
         """Show the rigid motion ``u`` (m) and ``theta`` (rad) per body, animated or held static."""
+        self._trajectory = None
         self._motion[:, 0, :] = 0.0
         self._motion[:, 1, :] = 0.0
         if u is not None and theta is not None and self._mesh is not None:
@@ -266,6 +329,73 @@ class Scene3D(QOpenGLWidget):
 
     def clear_motion(self) -> None:
         self.set_motion(None, None, False)
+
+    def set_trajectory(self, times: np.ndarray, u: np.ndarray, theta: np.ndarray, caption: str = "") -> None:
+        """Play back a transient: translation ``u`` (m) and rotation ``theta`` (rad) of every
+        body at every entry of ``times`` (s), shapes (times, bodies, 3)."""
+        if self._mesh is None or len(times) < 2:
+            self.clear_motion()
+            return
+        bodies = min(len(self._motion), u.shape[1])
+        self._trajectory = (
+            np.asarray(times, dtype=np.float64),
+            (np.asarray(u, dtype=np.float64)[:, :bodies] * SCENE_UNIT).astype(np.float32),
+            np.asarray(theta, dtype=np.float64)[:, :bodies].astype(np.float32),
+        )
+        self._peak = trajectory_peak(self._mesh, u[:, :bodies], theta[:, :bodies])
+        self._animated = True
+        self._caption = caption or "Transient"
+        self._time = float(times[0])
+        self._apply_time()
+        self.play(True)
+        self.update()
+
+    def has_trajectory(self) -> bool:
+        return self._trajectory is not None
+
+    def set_time(self, moment: float) -> None:
+        """Show the trajectory at simulation time ``moment`` (clamped to the run)."""
+        if self._trajectory is None:
+            return
+        times = self._trajectory[0]
+        self._time = float(np.clip(moment, times[0], times[-1]))
+        self._apply_time()
+        self.update()
+
+    def time(self) -> float:
+        return self._time
+
+    def set_rate(self, rate: float) -> None:
+        """Playback speed of a trajectory; at 1 one pass takes ``LOOP_SECONDS``."""
+        self._rate = float(rate)
+
+    def set_true_scale(self, on: bool) -> None:
+        """Play a trajectory at its real size instead of exaggerated to the amplitude setting."""
+        self._true_scale = bool(on)
+        self.update()
+
+    def exaggeration(self) -> float:
+        """Factor the shown motion of a trajectory is magnified by."""
+        if self._trajectory is None or self._true_scale:
+            return 1.0
+        return self._amplitude * self._extent / self._peak
+
+    def set_caption(self, text: str) -> None:
+        """Replace the caption of the motion on show without restarting it."""
+        if self._caption and text:
+            self._caption = text
+            self.update()
+
+    def _apply_time(self) -> None:
+        times, u, theta = self._trajectory
+        position = float(np.interp(self._time, times, np.arange(len(times))))
+        low = min(int(position), len(times) - 2)
+        weight = position - low
+        bodies = u.shape[1]
+        self._motion[:bodies, 0, :3] = (1.0 - weight) * u[low] + weight * u[low + 1]
+        self._motion[:bodies, 1, :3] = (1.0 - weight) * theta[low] + weight * theta[low + 1]
+        self._dirty["motion"] = True
+        self.timeChanged.emit(self._time)
 
     def has_motion(self) -> bool:
         return bool(self._caption)
@@ -321,14 +451,24 @@ class Scene3D(QOpenGLWidget):
         return self.grabFramebuffer()
 
     def capture_frame(self, phase: float):
-        """Render the current motion at ``phase`` (radians) and return the framebuffer image."""
-        previous = (self._phase, self._exporting)
+        """Render the current motion at ``phase`` (radians) and return the framebuffer image.
+
+        For a trajectory the phase runs through the whole transient: 0 is its first time and
+        2π its last.
+        """
+        previous = (self._phase, self._exporting, self._time)
         self._phase = phase
         self._exporting = True
         try:
+            if self._trajectory is not None:
+                times = self._trajectory[0]
+                self._time = float(times[0] + (times[-1] - times[0]) * phase / (2.0 * math.pi))
+                self._apply_time()
             return self.grabFramebuffer()
         finally:
-            self._phase, self._exporting = previous
+            self._phase, self._exporting, self._time = previous
+            if self._trajectory is not None:
+                self._apply_time()
 
     def frame_size(self) -> tuple[int, int]:
         dpr = self.devicePixelRatioF()
@@ -347,8 +487,8 @@ class Scene3D(QOpenGLWidget):
         GL.glDeleteShader(vertex)
         GL.glDeleteShader(fragment)
         self._program = program
-        names = ("u_proj", "u_view", "u_scale", "u_motion", "u_body_colors", "u_kind_colors", "u_color_mode",
-                 "u_selected", "u_hover", "u_pick", "u_select_color")
+        names = ("u_proj", "u_view", "u_scale", "u_motion", "u_body_colors", "u_group_colors", "u_kind_colors",
+                 "u_color_mode", "u_selected", "u_hover", "u_pick", "u_select_color")
         self._uniforms = {name: GL.glGetUniformLocation(program, name) for name in names}
         self._vao = GL.glGenVertexArrays(1)
         self._vbo = GL.glGenBuffers(1)
@@ -356,7 +496,7 @@ class Scene3D(QOpenGLWidget):
         GL.glBindVertexArray(self._vao)
         GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self._vbo)
         GL.glBindBuffer(GL.GL_ELEMENT_ARRAY_BUFFER, self._ebo)
-        for location, size, offset in ((0, 3, 0), (1, 3, 12), (2, 2, 24), (3, 1, 32), (4, 1, 36)):
+        for location, size, offset in ((0, 3, 0), (1, 3, 12), (2, 2, 24), (3, 1, 32), (4, 1, 36), (5, 1, 40)):
             GL.glEnableVertexAttribArray(location)
             GL.glVertexAttribPointer(location, size, GL.GL_FLOAT, GL.GL_FALSE, STRIDE, ctypes.c_void_p(offset))
         GL.glBindVertexArray(0)
@@ -365,9 +505,10 @@ class Scene3D(QOpenGLWidget):
         GL.glUniform3fv(self._uniforms["u_kind_colors"], 5, colors)
         GL.glUniform1i(self._uniforms["u_motion"], 0)
         GL.glUniform1i(self._uniforms["u_body_colors"], 1)
+        GL.glUniform1i(self._uniforms["u_group_colors"], 2)
         GL.glUseProgram(0)
         self._gl_ready = True
-        self._dirty = {"mesh": True, "motion": True, "colors": True}
+        self._dirty = {"mesh": True, "motion": True, "colors": True, "groups": True}
 
     def _upload(self) -> None:
         mesh = self._mesh
@@ -389,6 +530,15 @@ class Scene3D(QOpenGLWidget):
             for index in range(count):
                 table[index, 0, :3] = theme.body_rgb(index)
             self._textures["colors"] = _texture_2d(1, max(count, 1), table, self._textures["colors"])
+        if self._dirty["groups"]:
+            self._dirty["groups"] = False
+            table = self._group_table
+            count = 0 if table is None else len(table)
+            rows = max(-(-count // GROUP_TEXTURE_WIDTH), 1)
+            data = np.zeros((rows * GROUP_TEXTURE_WIDTH, 4), dtype=np.float32)
+            if count:
+                data[:count] = table
+            self._textures["groups"] = _texture_2d(GROUP_TEXTURE_WIDTH, rows, data.reshape(rows, GROUP_TEXTURE_WIDTH, 4), self._textures["groups"])
         if self._dirty["motion"]:
             self._dirty["motion"] = False
             count = len(self._motion)
@@ -411,6 +561,8 @@ class Scene3D(QOpenGLWidget):
     def _current_scale(self) -> float:
         if not self._caption:
             return 0.0
+        if self._trajectory is not None:
+            return self.exaggeration()
         amplitude = self._amplitude * self._extent / self._peak
         if self._animated or self._exporting:
             return amplitude * math.sin(self._phase)
@@ -418,7 +570,13 @@ class Scene3D(QOpenGLWidget):
 
     def _tick(self) -> None:
         dt = self._clock.restart() / 1000.0
-        self._phase = (self._phase + 2.0 * math.pi * self._speed * dt) % (2.0 * math.pi)
+        if self._trajectory is not None:
+            times = self._trajectory[0]
+            span = float(times[-1] - times[0])
+            self._time = float(times[0] + (self._time - times[0] + dt * self._rate * span / LOOP_SECONDS) % span)
+            self._apply_time()
+        else:
+            self._phase = (self._phase + 2.0 * math.pi * self._speed * dt) % (2.0 * math.pi)
         self.update()
 
     # --------------------------------------------------------------- painting
@@ -454,13 +612,18 @@ class Scene3D(QOpenGLWidget):
         GL.glBindTexture(GL.GL_TEXTURE_2D, self._textures["motion"])
         GL.glActiveTexture(GL.GL_TEXTURE1)
         GL.glBindTexture(GL.GL_TEXTURE_2D, self._textures["colors"])
+        GL.glActiveTexture(GL.GL_TEXTURE2)
+        GL.glBindTexture(GL.GL_TEXTURE_2D, self._textures["groups"])
+        GL.glActiveTexture(GL.GL_TEXTURE0)
+        by_group = self._pick_mode == "group"
         GL.glUniformMatrix4fv(self._uniforms["u_proj"], 1, GL.GL_TRUE, proj)
         GL.glUniformMatrix4fv(self._uniforms["u_view"], 1, GL.GL_TRUE, view)
         GL.glUniform1f(self._uniforms["u_scale"], self._current_scale())
-        GL.glUniform1f(self._uniforms["u_color_mode"], 1.0 if self._color_mode == "body" else 0.0)
-        GL.glUniform1f(self._uniforms["u_selected"], float(self._selected))
-        GL.glUniform1f(self._uniforms["u_hover"], float(self._hover))
-        GL.glUniform1f(self._uniforms["u_pick"], 1.0 if pick else 0.0)
+        GL.glUniform1f(self._uniforms["u_color_mode"], {"body": 1.0, "group": 2.0}.get(self._color_mode, 0.0))
+        # Picking by group shows selection and hover through the colour table instead.
+        GL.glUniform1f(self._uniforms["u_selected"], -1.0 if by_group else float(self._selected))
+        GL.glUniform1f(self._uniforms["u_hover"], -1.0 if by_group else float(self._hover))
+        GL.glUniform1f(self._uniforms["u_pick"], (2.0 if by_group else 1.0) if pick else 0.0)
         GL.glUniform3f(self._uniforms["u_select_color"], *theme.SELECTION_RGB)
         GL.glBindVertexArray(self._vao)
         assert self._mesh is not None
@@ -486,6 +649,8 @@ class Scene3D(QOpenGLWidget):
             self._pitch,
             tuple(self._target),
             self._current_scale(),
+            self._time if self._trajectory is not None else None,
+            self._pick_mode,
             tuple(sorted(kind for kind, on in self._visible.items() if on)),
         )
         if state != self._pick_state:
@@ -509,19 +674,27 @@ class Scene3D(QOpenGLWidget):
                 pixel = np.frombuffer(bytes(data), dtype=np.uint8)
             else:
                 pixel = np.asarray(data, dtype=np.uint8).ravel()
-            ident = int(pixel[0]) + 256 * int(pixel[1])
+            ident = int(pixel[0]) + 256 * int(pixel[1]) + 65536 * int(pixel[2])
             return ident - 1
 
+        by_group = self._pick_mode == "group"
         if self._hover_request is not None:
-            body = read(self._hover_request)
+            picked = read(self._hover_request)
             self._hover_request = None
-            if body != self._hover:
-                self._hover = body
-                self.hovered.emit(body)
+            if by_group:
+                if picked != self._hover_group:
+                    self._hover_group = picked
+                    self.groupHovered.emit(picked)
+            elif picked != self._hover:
+                self._hover = picked
+                self.hovered.emit(picked)
         if self._click_request is not None:
-            body = read(self._click_request)
+            picked = read(self._click_request)
             self._click_request = None
-            self.bodyClicked.emit(body)
+            if by_group:
+                self.groupClicked.emit(picked, self._click_modifiers)
+            else:
+                self.bodyClicked.emit(picked)
         fbo.release()
         GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, self.defaultFramebufferObject())
 
@@ -553,7 +726,13 @@ class Scene3D(QOpenGLWidget):
             if self._animated and not self._exporting:
                 painter.setPen(QColor(theme.MUTED))
                 state = "playing" if self._playing else "paused"
-                painter.drawText(rect.adjusted(0, 18, 0, 0), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop, f"{state} · amplitude {self._amplitude * 100:.1f}% of extent")
+                if self._trajectory is None:
+                    detail = f"amplitude {self._amplitude * 100:.1f}% of extent"
+                elif self._true_scale:
+                    detail = "true scale"
+                else:
+                    detail = f"motion × {self.exaggeration():,.3g}"
+                painter.drawText(rect.adjusted(0, 18, 0, 0), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop, f"{state} · {detail}")
 
     # ------------------------------------------------------------------ input
     def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt API
@@ -589,6 +768,7 @@ class Scene3D(QOpenGLWidget):
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802 - Qt API
         if self._drag_last is not None and not self._drag_moved and event.button() == Qt.MouseButton.LeftButton:
             self._click_request = event.position()
+            self._click_modifiers = int(event.modifiers().value)
             self.update()
         self._drag_last = None
         self._drag_button = None
@@ -606,6 +786,10 @@ class Scene3D(QOpenGLWidget):
         if self._hover != -1:
             self._hover = -1
             self.hovered.emit(-1)
+            self.update()
+        if self._hover_group != -1:
+            self._hover_group = -1
+            self.groupHovered.emit(-1)
             self.update()
 
     def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt API

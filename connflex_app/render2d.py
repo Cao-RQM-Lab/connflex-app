@@ -18,7 +18,16 @@ from shapely.geometry.base import BaseGeometry
 
 from connflex_core import Layout, Structure
 
-from connflex_app.geometry import SCENE_UNIT, TriangleCache, triangulate, visible_rejected
+from connflex_app.geometry import (
+    SCENE_UNIT,
+    Groups,
+    Piece,
+    TriangleCache,
+    device_group_lookup,
+    silicon_pieces,
+    triangulate,
+    visible_rejected,
+)
 
 EMPTY = np.zeros((0, 2), dtype=np.float32)
 
@@ -78,10 +87,25 @@ class RenderData:
     free_bodies: set[int] = field(default_factory=set)
     holes: MultiPolygon | None = None
     box_layer: MultiPolygon | None = None
+    pieces: list[Piece] = field(default_factory=list)
+    groups: Groups | None = None
+    beam_groups: list[int] = field(default_factory=list)
+    rejected_groups: list[int] = field(default_factory=list)
+    group_tree: STRtree | None = None
+    group_tags: list[int] = field(default_factory=list)
+    group_geometry: dict[int, list[BaseGeometry]] = field(default_factory=dict)
 
     @property
     def origin_m(self) -> NDArray[np.float64]:
         return self.origin / SCENE_UNIT
+
+    def group_at(self, x: float, y: float) -> int:
+        """Paint group of the topmost silicon at a point in metres: beams and bridges first,
+        then the device layer, then the handle. -1 where there is none."""
+        if self.group_tree is None:
+            return -1
+        hits = self.group_tree.query(shapely.Point(x, y), predicate="intersects")
+        return self.group_tags[int(hits.min())] if hits.size else -1
 
     def register(self, geometry: BaseGeometry) -> None:
         key = id(geometry)
@@ -139,7 +163,7 @@ def prepare_layout(
 def prepare_project(
     layout: Layout,
     structure: Structure,
-    plates: dict[int, BaseGeometry],
+    pieces: list[Piece] | None,
     holes: list[Polygon],
     advance: Callable[[], None] | None = None,
     *,
@@ -147,11 +171,21 @@ def prepare_project(
 ) -> RenderData:
     """Render data for an extracted structure: bodies, beams, nets, graphs, and picking.
 
-    ``plates`` are the closed device plates (see :func:`connflex_app.geometry.closed_plates`);
+    ``pieces`` are the solid silicon pieces (see :func:`connflex_app.geometry.silicon_pieces`);
     ``cache`` can be shared with the 3D mesh builder so nothing is triangulated twice.
     """
+    if pieces is None:
+        pieces = silicon_pieces(structure)
     data = prepare_layout(layout, cache=cache)
     data.rejected = visible_rejected(structure)
+    data.pieces = pieces
+    data.groups = Groups.of(structure)
+    lookup = device_group_lookup(structure, data.groups)
+    data.beam_groups = [data.groups.of_net(beam.net) for beam in structure.beams]
+    data.rejected_groups = [lookup(candidate.polygon) for candidate in data.rejected]
+    by_body: dict[int, list[Piece]] = {}
+    for piece in pieces:
+        by_body.setdefault(piece.body, []).append(piece)
     if holes:
         data.holes = MultiPolygon(holes)
         data.register(data.holes)
@@ -175,9 +209,12 @@ def prepare_project(
         geoms.append(candidate.polygon)
         tags.append(("rejected", i))
     for body in structure.bodies:
-        for geometry in (plates[body.index], body.handle, body.box, body.device, body.stubs):
+        mine = by_body.get(body.index, [])
+        for piece in mine:
+            data.register(piece.geometry)
+        for geometry in (body.box, body.device, body.stubs):
             data.register(geometry)
-        data.outlines[body.index] = plates[body.index]
+        data.outlines[body.index] = MultiPolygon([piece.geometry for piece in mine if piece.layer == "device"])
         for part in body.stubs.geoms:
             geoms.append(part)
             tags.append(("stub", body.index))
@@ -198,6 +235,18 @@ def prepare_project(
     data.pick_tree = STRtree(geoms) if geoms else None
     data.pick_tags = tags
     data.cache = None  # drop the shared float64 triangulations; the float32 copies above are what the view needs
+
+    # Picking by paint group: what conducts on top first, then device silicon, then the handle.
+    layered: list[tuple[BaseGeometry, int]] = []
+    layered += [(beam.polygon, group) for beam, group in zip(structure.beams, data.beam_groups)]
+    layered += [(candidate.polygon, group) for candidate, group in zip(data.rejected, data.rejected_groups)]
+    layered += [(piece.geometry, piece.group) for piece in pieces if piece.layer == "device"]
+    layered += [(piece.geometry, piece.group) for piece in pieces if piece.layer == "handle"]
+    layered = [(geometry, group) for geometry, group in layered if group >= 0]
+    data.group_tree = STRtree([geometry for geometry, _group in layered]) if layered else None
+    data.group_tags = [group for _geometry, group in layered]
+    for geometry, group in layered:
+        data.group_geometry.setdefault(group, []).append(geometry)
 
     centers = {body.index: (float(body.inertial.center[0]), float(body.inertial.center[1])) for body in structure.bodies}
     beams = [(beam.bodies[0], beam.bodies[1], beam.start[:2], beam.end[:2], beam.index) for beam in structure.beams]

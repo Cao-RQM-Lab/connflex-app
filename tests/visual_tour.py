@@ -211,6 +211,162 @@ shot("10_3d_only.png")
 window.view_actions["split"].trigger()
 pump(200)
 
+# ------------------------------------------------------------------ electrical tab
+import numpy as np  # noqa: E402
+
+project = window.session.project
+structure = project.structure
+STATOR, SHUTTLE, LEFT = (1050e-6, 600e-6), (800e-6, 600e-6), (150e-6, 600e-6)
+demo = os.path.basename(gds) == "demo_resonator.gds"
+
+
+def at(point) -> QPoint:
+    return window.layout_view._transform().map(QPointF(*point)).toPoint()
+
+
+def hover(point) -> None:
+    """Move the pointer over a layout point (a synthesized event: the real cursor is elsewhere)."""
+    from PySide6.QtCore import QEvent
+    from PySide6.QtGui import QMouseEvent
+
+    pos = QPointF(at(point))
+    none = Qt.MouseButton.NoButton
+    event = QMouseEvent(QEvent.Type.MouseMove, pos, window.layout_view.mapToGlobal(pos), none, none, Qt.KeyboardModifier.NoModifier)
+    window.layout_view.mouseMoveEvent(event)
+
+
+def click(point, modifier=Qt.KeyboardModifier.NoModifier) -> None:
+    QTest.mouseClick(window.layout_view, Qt.MouseButton.LeftButton, modifier, at(point))
+    pump(150)
+
+
+window.layout_view.fit()
+window.scene.reset_view()
+window.set_workspace("electrical")
+pump(400)
+shot("11_electrical_tab.png")
+window.compute_capacitance()
+wait_until(
+    lambda: not window._busy,
+    what="capacitance",
+    snapshots=((0.25, lambda: shot("11b_progress_capacitance.png", window.statusBar())),),
+)
+pump(300)
+print("capacitance:", window.status_label.text())
+print("model status:", window.capacitance.status.text())
+if demo:
+    click(STATOR)
+    click(SHUTTLE, Qt.KeyboardModifier.ShiftModifier)
+    hover(LEFT)
+    pump(200)
+    print("picks:", window.capacitance.picks(), "|", window.capacitance.pair_title.text(), "=", window.capacitance.pair_value.text())
+    print("parts:", {k: v.text() for k, v in window.capacitance.part_values.items()}, "|", window.capacitance.totals.text())
+    print("couplings:", [[window.capacitance.couplings.item(r, c).text() for c in range(3)] for r in range(window.capacitance.couplings.rowCount())])
+    print("slopes:", [[window.capacitance.slopes.item(r, c).text() for c in range(7)] for r in range(window.capacitance.slopes.rowCount())])
+    print("hover:", window.hover_label.text())
+    shot("12_electrical_pair.png")
+    shot("12b_electrical_2d.png", window.layout_view)
+    shot("12c_electrical_3d.png", window.scene)
+    window.capacitance.set_kind("body")
+    pump(200)
+    click(SHUTTLE)
+    QTest.mouseClick(window.scene, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.ControlModifier, QPoint(int(window.scene.width() * 0.5), int(window.scene.height() * 0.3)))
+    pump(400)
+    print("bodies:", window.capacitance.picks(), "|", window.capacitance.pair_title.text(), "=", window.capacitance.pair_value.text())
+    shot("13_electrical_bodies.png")
+    window.capacitance.set_kind("electrode")
+    pump(200)
+    click(STATOR)
+    pump(200)
+    shot("13b_electrical_electrodes.png")
+    window.capacitance.set_kind("net")
+    click(STATOR)
+    click(SHUTTLE, Qt.KeyboardModifier.ShiftModifier)
+    csv_path = os.path.join(out, "capacitance_nets.csv")
+    window.export_capacitance_matrix(csv_path)
+    window.export_capacitance_report(os.path.join(out, "capacitance.json"))
+    print("matrix csv:", open(csv_path).read().strip().splitlines())
+
+# ------------------------------------------------------------- electromechanical tab
+window.set_workspace("electromechanical")
+pump(400)
+shot("14_em_tab_empty.png")
+if demo:
+    click(STATOR)
+    click(LEFT)
+    stator = structure.electrode_at(STATOR, "device").net
+    left = structure.electrode_at(LEFT, "device").net
+    print("drive nets after two clicks:", window.drive.nets(), "(stator", stator, "left", left, ")")
+    window.drive.add_step()
+    window.drive.add_step()
+    window.drive.set_voltage(stator, 0, 40.0)
+    window.drive.set_voltage(stator, 1, 0.0)
+    window.drive.set_voltage(stator, 2, 0.0)
+    window.drive.set_voltage(left, 0, 0.0)
+    window.drive.set_voltage(left, 1, 0.0)
+    window.drive.set_voltage(left, 2, 30.0)
+    window.drive.table.setCurrentCell(1, 2)
+    pump(300)
+    shot("15_em_drive_ready.png")
+    print("plan:", window.drive.plan().durations, "rise", window.drive.plan().rise_time, "| model:", window.drive.model_label.text())
+    window.run_transient()
+    wait_until(
+        lambda: not window._busy,
+        what="transient",
+        snapshots=(
+            (0.5, lambda: shot("15b_progress_transient.png", window.statusBar())),
+            (2.5, lambda: shot("15c_progress_transient_later.png", window.statusBar())),
+        ),
+    )
+    pump(500)
+    run = window.session.project.transient
+    print("transient:", window.status_label.text())
+    print("history:", [(t, round(sec, 2), [n for n, _ in st]) for t, sec, st, ok in window.progress.history()])
+    shot("16_em_transient_playing.png")
+    window._scrubbed(float(run.plan.edges[1]) * 0.5)
+    pump(300)
+    shot("16b_em_scrubbed_step1.png")
+    shot("16c_em_3d.png", window.scene)
+    shot("16d_em_2d.png", window.layout_view)
+    window._scrubbed(float(run.plan.edges[2]) + 0.6 * float(run.plan.durations[2]))
+    pump(300)
+    shot("16e_em_scrubbed_step3.png")
+    for quantity in ("energy", "clearance", "current", "displacement"):
+        window.timeline.quantity_combo.setCurrentIndex(window.timeline.quantity_combo.findData(quantity))
+        pump(150)
+        shot(f"17_timeline_{quantity}.png", window.timeline)
+    window.drive.table.setCurrentCell(1, 2)
+    window.solve_equilibrium(0)
+    wait_until(lambda: not window._busy, what="equilibrium")
+    pump(300)
+    print("equilibrium:", window.drive.result.text())
+    shot("18_em_equilibrium.png")
+    window._play_requested(True)
+    pump(600)
+    transient_gif = os.path.join(out, "transient.gif")
+    window.export_gif(transient_gif, frames=16, fps=20, scale=0.5)
+    wait_until(lambda: not window._busy, what="transient gif")
+    with Image.open(transient_gif) as gif:
+        print("transient gif:", gif.n_frames, "frames", gif.size)
+    npz_path = os.path.join(out, "transient.npz")
+    window.export_transient(npz_path)
+    with np.load(npz_path) as data:
+        print("transient npz:", sorted(data.files)[:6], data["times"].shape, data["displacement"].shape)
+    # Cancel: a long run is stopped from the status bar.
+    window.drive.set_duration(0, 5e-3)
+    window.run_transient()
+    wait_until(lambda: window.progress.cancel_button.isVisible() and window.progress._current == "transient", what="transient started")
+    pump(400)
+    shot("19_progress_cancellable.png", window.statusBar())
+    window.progress.cancel_button.click()
+    wait_until(lambda: not window._busy, what="cancel")
+    print("after cancel:", window.status_label.text(), "| run kept:", window.session.project.transient is run)
+    window.drive.set_duration(0, None)
+    window.set_workspace("mechanical")
+    pump(400)
+    shot("20_back_to_mechanical.png")
+    print("back in mechanical:", window.playback_caption.text(), "| docks:", [d.windowTitle() for d in (window.dock_modes, window.dock_stiffness, window.dock_capacitance, window.dock_drive, window.dock_timeline) if d.isVisible()])
+
 print("worst event-loop stalls:", {k: f"{v * 1000:.0f} ms" for k, v in STALLS.items()})
 print("TOUR OK")
 window.close()

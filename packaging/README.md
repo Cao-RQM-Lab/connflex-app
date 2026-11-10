@@ -18,6 +18,12 @@ dist/ConnFlex.app/Contents/MacOS/ConnFlex --smoke-test    # real GUI, saves smok
 
 `make_icons.py` regenerates `icon.png`, `icon.ico`, and `icon.icns`.
 
+connflex-core solves the capacitance field in child interpreters that it starts as
+`<sys.executable> -m connflex_core._serve`. In a bundle `sys.executable` is the application, so
+`launcher.py` checks for that command line before it imports anything of the GUI and runs the
+worker loop instead (`connflex_app/worker.py`). The self-test solves the demo's field with two
+workers, so a bundle whose workers cannot start fails it.
+
 The bundle's version comes from the git tag through setuptools-scm (run the build from a
 checkout with tags fetched). Apple's `CFBundleShortVersionString` gets the plain `X.Y.Z`
 part; the full version string is stored under the `ConnFlexVersion` key of `Info.plist`.

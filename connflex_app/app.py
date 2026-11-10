@@ -23,15 +23,21 @@ def _configure_surface_format() -> None:
 USAGE = """usage: connflex-app [LAYOUT.gds] [--version] [--self-test] [--smoke-test [SCREENSHOT.png]]
 
   --version     print the version and exit
-  --self-test   run the analysis pipeline on the bundled demo without a GUI and exit
-  --smoke-test  start the GUI, run the demo through extraction and the modal solve,
-                save a screenshot (default smoke_test.png), and exit
+  --self-test   run the analysis pipeline on the bundled demo without a GUI and exit:
+                extraction, modes, stiffness, capacitance, a transient, and the GDS export
+  --smoke-test  start the GUI, run the demo through all three tabs (modes, capacitance,
+                a transient), save a screenshot (default smoke_test.png), and exit
 """
 
 
 def main(argv: list[str] | None = None) -> int:
     args = list(argv if argv is not None else sys.argv)
     options = args[1:]
+    from connflex_app.worker import is_worker, serve
+
+    if is_worker(args):  # a field-solver process of connflex-core (see connflex_app.worker)
+        serve()
+        return 0
     if "--help" in options or "-h" in options:
         print(USAGE)
         return 0

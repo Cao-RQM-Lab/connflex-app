@@ -14,12 +14,12 @@ from connflex_app.gds_io import guess_roles, inspect_gds, load_layout
 from connflex_app.geometry import (
     KIND_BEAM,
     build_mesh,
-    closed_plates,
     describe_modes,
     displacement_field,
     motion_from_vector,
     normalized,
-        release_holes,
+    release_holes,
+    silicon_pieces,
 )
 from connflex_app.render2d import prepare_layout, prepare_project
 from connflex_app.selftest import run as selftest
@@ -34,15 +34,15 @@ def project():
     layout = load_layout(path, settings, info.bounds_m(None))
     structure = cf.extract(layout, settings.stack(), settings.params())
     holes = release_holes(layout, settings.params().release_hole_max_area)
-    plates = closed_plates(structure)
-    mesh = build_mesh(structure, settings.stack(), plates)
+    pieces = silicon_pieces(structure)
+    mesh = build_mesh(structure, settings.stack(), pieces)
     return {
         "info": info,
         "settings": settings,
         "layout": layout,
         "structure": structure,
         "holes": holes,
-        "plates": plates,
+        "pieces": pieces,
         "mesh": mesh,
         "system": assemble(structure),
         "modal": structure.modal(),
@@ -107,7 +107,7 @@ def test_render_data(project):
     layout, structure = project["layout"], project["structure"]
     preview = prepare_layout(layout)
     assert preview.pick_tree is not None and len(preview.tris) == 4
-    render = prepare_project(layout, structure, project["plates"], project["holes"])
+    render = prepare_project(layout, structure, project["pieces"], project["holes"])
     assert render.beam_counts[structure.bodies[1].index] == 5
     assert render.graph is not None and len(render.graph["beams"]) == 9
     assert all(np.isfinite(t).all() for t in render.tris.values())

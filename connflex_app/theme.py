@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import colorsys
-
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import QApplication
+
+from connflex_app import paint
 
 BG = "#14161b"
 SURFACE = "#1b1e25"
@@ -52,9 +52,8 @@ def qcolor(value: str, alpha: float = 1.0) -> QColor:
 
 
 def categorical_rgb(index: int, saturation: float = 0.62, lightness: float = 0.6) -> tuple[float, float, float]:
-    """Well-separated colour for category ``index`` from a golden-angle hue walk."""
-    hue = (index * 0.618033988749895 + 0.11) % 1.0
-    return colorsys.hls_to_rgb(hue, lightness, saturation)
+    """Well-separated colour for category ``index`` (the palette of :mod:`connflex_app.paint`)."""
+    return paint.categorical(index, saturation, lightness)
 
 
 def categorical(index: int, alpha: float = 1.0) -> QColor:
@@ -146,6 +145,13 @@ QRadioButton::indicator {{ width: 12px; height: 12px; border-radius: 8px; border
 QRadioButton::indicator:hover {{ border-color: {MUTED}; }}
 QRadioButton::indicator:checked {{ border: 2px solid {ACCENT}; background: qradialgradient(cx:0.5, cy:0.5, radius:0.5, fx:0.5, fy:0.5, stop:0 {ACCENT}, stop:0.55 {ACCENT}, stop:0.62 {BG}, stop:1 {BG}); }}
 QFrame#card {{ background: {PANEL}; border: 1px solid {BORDER}; border-radius: 8px; }}
+QToolBar#toolbar_workspaces {{ padding: 0 8px; spacing: 0; }}
+QTabBar#workspaces {{ background: transparent; }}
+QTabBar#workspaces::tab {{ background: transparent; color: {MUTED}; padding: 8px 18px 7px 18px; margin-right: 2px; border: none; border-bottom: 2px solid transparent; font-weight: 600; }}
+QTabBar#workspaces::tab:hover {{ color: {TEXT}; }}
+QTabBar#workspaces::tab:selected {{ color: {TEXT}; border-bottom: 2px solid {ACCENT}; }}
+QTabBar#workspaces::tab:disabled {{ color: #5c6373; }}
+QLabel#legend {{ color: #c9cedb; padding: 0 4px; }}
 """
 
 
